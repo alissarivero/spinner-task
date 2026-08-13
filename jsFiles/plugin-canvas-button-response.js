@@ -138,6 +138,7 @@ var jsPsychCanvasButtonResponse = (function (jspsych) {
           // store data
           let spinnerData = {
             outcomes: [],
+            hold_durations: [],
             score: trial.score || 0,
             rt: null,
             isSpinning: false,
@@ -160,6 +161,7 @@ var jsPsychCanvasButtonResponse = (function (jspsych) {
               // gather the data to store for the trial
               var trial_data = {
                   outcomes: spinnerData.outcomes,
+                  hold_durations: spinnerData.hold_durations,
                   score: spinnerData.score,
                   rt: spinnerData.rt,
                   n_spins: spinnerData.outcomes.length,

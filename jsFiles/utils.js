@@ -3,15 +3,24 @@
 const jsPsych = initJsPsych({
     on_finish: (data) => {
         data.boot = boot;
+        // download CSV to the browser's Downloads folder
+        jsPsych.data.get().localSave("csv", filename);
         if(!boot) {
             document.body.innerHTML = 
                 `<div align='center' style="margin: 10%">
                     <p>Thank you for participating!<p>
+                    <p>Your data file (<strong>${filename}</strong>) has been downloaded.</p>
                     <b>You will be automatically re-directed to Prolific in a few moments.</b>
                 </div>`;
             setTimeout(() => { 
                 location.href = `https://app.prolific.co/submissions/complete?cc=${completionCode}`
             }, 2000);
+        } else {
+            document.body.innerHTML =
+                `<div align='center' style="margin: 10%">
+                    <p>Thank you for participating!</p>
+                    <p>Your data file (<strong>${filename}</strong>) has been downloaded.</p>
+                </div>`;
         }
     },
 });
@@ -323,28 +332,32 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
   const rimWidth = 5;
   const POINTER_DEG = 270; // fixed pointer at top of wheel (canvas degrees, clockwise from east)
 
-  /* spin dynamics — time-based (deg/s), calibrated to former 60fps per-frame values */
+  /* spin dynamics — hold = constant pace; release = launch + fixed-duration coast */
   const REF_FPS = 60;
   const REF_DT = 1 / REF_FPS;
   const MAX_DT = 0.05; // clamp so backgrounded tabs don't jump
-  // stronger drag when fast, softer when slow (longer end-of-spin suspense)
-  const frictionAt = (speed) => {
-    const t = Math.min(1, Math.abs(speed) / (40 * REF_FPS)); // 0 = slow, 1 = fast
-    return 0.992 - 0.012 * t; // ~0.980 when fast → ~0.992 when slow (per ref frame)
-  };
-  const holdCoastFriction = 0.995; // light ease while holding at peak (per ref frame)
-  const accelFactor = 1.06; // per ref frame while accelerating
+  const PACE_VEL = 270; // deg/s — constant moderate rate while space is held
+  const LAUNCH_VEL = 40 * REF_FPS; // deg/s — rapid boost on release
+  const SPIN_DURATION = 4; // seconds from release until stop
   const angVelMin = 3 * REF_FPS; // deg/s — below stopThresh treated as a stop
-  let angVelMax = 0; // Random peak ang.vel. (deg/s)
   let angVel = 0;    // Current angular velocity (deg/s)
+  let decelLaunchSpeed = 0; // signed launch speed used for post-release ease
+  let decelElapsed = 0; // seconds since release
   let animFrame = null;
-  let hasReachedPeak = false;
   let lastTs = null;
+  let spaceHeld = false; // true while space is physically down
+  let releaseTimer = null; // debounce spurious keyup during a hold
+  let holdStartTs = null; // performance.now() when current press began
+  let pendingHoldMs = null; // hold length (ms) for the spin about to land
+
+  if (!Array.isArray(spinnerData.hold_durations)) {
+    spinnerData.hold_durations = [];
+  }
 
   /* state variables */
   let isSpinning = false;      // true when wheel is spinning, false otherwise
-  let isAccelerating = false;  // true when wheel is accelerating, false otherwise
-  let isDecelerating = false;  // true when friction slowdown has begun
+  let isAccelerating = false;  // true while space is held (constant pace)
+  let isDecelerating = false;  // true after release (launch + coast-down)
   let isLanding = false;       // true during post-land feedback
   let oldAngle = 0;            // current wheel angle
   let currentAngle = 0;        // wheel angle when stopped
@@ -357,15 +370,14 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
   let forcedTargetIndex = null; // sector index for current decelerating spin
   let forcedTargetAngle = null; // wheel rotation mod for random point inside that sector
   const stopThresh = () => angVelMin * 0.1;
-  const steerK = 0.004;
-  const steerMaxNudge = 0.07;
   const residualStep = 1.6 * REF_FPS; // deg/s when creeping into target sector
   const residualAlignTol = 1.0; // deg — close enough to land
   const wedgeInsetFrac = 0.04; // keep landings slightly inside borders (was 0.15)
 
-  // apply a per-ref-frame multiplier over real elapsed time
-  const applyFrameFactor = (value, factorPerFrame, dt) => {
-    return value * Math.pow(factorPerFrame, dt * REF_FPS);
+  // ease-out speed over fixed spin duration (t in [0, 1])
+  const easedSpeed = (launchSpeed, t) => {
+    const u = Math.max(0, Math.min(1, t));
+    return launchSpeed * Math.pow(1 - u, 2);
   };
 
   const isForcingThisSpin = () => {
@@ -409,18 +421,13 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     return predicted + shortest;
   };
 
-  // Fixed 1/60s step simulation in deg/s so forced steering matches live physics
-  const predictFinalAngle = (angle, speed) => {
+  // Fixed-step simulation matching post-release ease-out (SPIN_DURATION)
+  const predictFinalAngle = (angle, launchSpeed) => {
     let a = angle;
-    let s = speed;
-    const thresh = stopThresh();
-    for (let i = 0; i < 20000; i++) {
-      s = applyFrameFactor(s, frictionAt(s), REF_DT);
-      if (Math.abs(s) > thresh) {
-        a += s * REF_DT;
-      } else {
-        break;
-      }
+    const steps = Math.ceil(SPIN_DURATION / REF_DT);
+    for (let i = 0; i < steps; i++) {
+      const t = (i * REF_DT) / SPIN_DURATION;
+      a += easedSpeed(launchSpeed, t) * REF_DT;
     }
     return a;
   };
@@ -476,22 +483,6 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     render(oldAngle);
     return getIndex() !== forcedTargetIndex ||
       Math.abs(nearestTargetAngle(oldAngle, forcedTargetAngle) - oldAngle) > residualAlignTol;
-  };
-
-  const steerSpeedTowardTarget = (angle, speed, dt) => {
-    if (forcedTargetAngle === null || Math.abs(speed) < 1e-6) return speed;
-    const predicted = predictFinalAngle(angle, speed);
-    const targetAngle = nearestTargetAngle(predicted, forcedTargetAngle);
-    const dir = Math.sign(speed) || 1;
-    const shortest = ((targetAngle - predicted + 540) % 360) - 180;
-    const error = shortest * dir;
-    // scale nudge by elapsed ref-frames so 120Hz doesn't steer 2× as hard
-    const frameScale = dt * REF_FPS;
-    const adj = Math.max(
-      -steerMaxNudge * frameScale,
-      Math.min(steerMaxNudge * frameScale, steerK * error * frameScale)
-    );
-    return speed * (1 + adj);
   };
 
   const drawSector = (sectorsList, highlightIndex) => {
@@ -584,6 +575,10 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
       isAccelerating = false;
       spinnerData.isSpinning = false;
       drawSector(sectors, null);
+      // still holding space after landing — resume pacing without a re-press
+      if (spaceHeld) {
+        startSpin();
+      }
     }, 1000);
   };
 
@@ -596,6 +591,10 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     isLanding = true;
     const sector = sectors[idx];
     spinnerData.outcomes.push(sector.value);
+    spinnerData.hold_durations.push(
+      pendingHoldMs != null ? pendingHoldMs : null
+    );
+    pendingHoldMs = null;
     drawSector(sectors, idx);
     if (sector.value === 5) {
       if (stopConfetti) stopConfetti();
@@ -624,38 +623,28 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     }
     dt = Math.min(dt, MAX_DT);
 
-    let speed = angVel;
-
-    // accelerate to peak, then light coast while space is held (no flat cruise)
-    if (isAccelerating) {
-      if (hasReachedPeak || Math.abs(speed) >= angVelMax) {
-        hasReachedPeak = true;
-        if (Math.abs(speed) > angVelMax) {
-          speed = angVelMax * Math.sign(speed || 1);
-        }
-        speed = applyFrameFactor(speed, holdCoastFriction, dt);
-        angVel = speed;
-        oldAngle += angVel * dt;
-        render(oldAngle);
-        animFrame = window.requestAnimationFrame(giveMoment);
-        return;
-      }
-      speed = applyFrameFactor(speed, accelFactor, dt);
-      angVel = speed;
-      oldAngle += speed * dt;
+    // hold / pre-launch: constant moderate pace until beginStop starts coast-down
+    if (isSpinning && !isDecelerating && !isLanding) {
+      isAccelerating = true;
+      angVel = PACE_VEL;
+      oldAngle += angVel * dt;
       render(oldAngle);
       animFrame = window.requestAnimationFrame(giveMoment);
       return;
     }
 
-    // decelerate and stop — steer speed so it visibly settles on target
-    isDecelerating = true;
-    if (forcedTargetAngle !== null && Math.abs(speed) > stopThresh()) {
-      speed = steerSpeedTowardTarget(oldAngle, speed, dt);
+    // release: ease from launch speed over fixed SPIN_DURATION
+    if (!isDecelerating) {
+      animFrame = window.requestAnimationFrame(giveMoment);
+      return;
     }
-    if (Math.abs(speed) > stopThresh()) {
-      speed = applyFrameFactor(speed, frictionAt(speed), dt);
-      angVel = speed;
+
+    decelElapsed += dt;
+    const t = decelElapsed / SPIN_DURATION;
+    let speed = easedSpeed(decelLaunchSpeed, t);
+    angVel = speed;
+
+    if (t < 1) {
       oldAngle += speed * dt;
       render(oldAngle);
       animFrame = window.requestAnimationFrame(giveMoment);
@@ -675,31 +664,47 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     isSpinning = true;
     isAccelerating = true;
     isDecelerating = false;
-    hasReachedPeak = false;
     forcedTargetIndex = null;
     forcedTargetAngle = null;
+    decelElapsed = 0;
+    decelLaunchSpeed = 0;
+    // resume pacing while still held (e.g. after landing) — start a new hold clock
+    if (spaceHeld && holdStartTs == null) {
+      holdStartTs = performance.now();
+    }
     spinnerData.isSpinning = true;
     lastTs = null;
-    angVelMax = rand(25, 50) * REF_FPS;
-    angVel = 8 * REF_FPS; // initial kick (deg/s)
+    angVel = PACE_VEL;
     animFrame = window.requestAnimationFrame(giveMoment);
   };
 
   const beginStop = () => {
     if (!active || !isSpinning || isDecelerating || isLanding) return;
+    if (spaceHeld) return; // never launch while space is still down
     isAccelerating = false;
     isDecelerating = true;
+    // launch: rapid velocity boost; spin time is fixed (not hold-duration)
+    angVel = LAUNCH_VEL;
+    decelElapsed = 0;
     if (isForcingThisSpin()) {
       setupForcedLanding();
     }
+    decelLaunchSpeed = angVel;
   };
 
   const onKeyDown = (e) => {
     if (!active) return;
     if (e.code !== "Space" && e.key !== " ") return;
     e.preventDefault();
-    if (e.repeat) return; // ignore held-repeat; hold duration is via keyup
-
+    spaceHeld = true;
+    if (holdStartTs == null) {
+      holdStartTs = performance.now();
+    }
+    // cancel a pending launch from a spurious keyup (key-repeat re-asserts hold)
+    if (releaseTimer != null) {
+      clearTimeout(releaseTimer);
+      releaseTimer = null;
+    }
     if (!isSpinning && !isLanding) {
       startSpin();
     }
@@ -709,10 +714,21 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     if (!active) return;
     if (e.code !== "Space" && e.key !== " ") return;
     e.preventDefault();
-
-    if (isSpinning && !isDecelerating && !isLanding) {
-      beginStop();
-    }
+    spaceHeld = false;
+    const keyupTs = performance.now();
+    // debounce: brief keyup glitches during a hold shouldn't kill pacing
+    if (releaseTimer != null) clearTimeout(releaseTimer);
+    releaseTimer = setTimeout(() => {
+      releaseTimer = null;
+      if (spaceHeld) return; // hold re-asserted; keep original holdStartTs
+      if (holdStartTs != null) {
+        pendingHoldMs = Math.round(keyupTs - holdStartTs);
+        holdStartTs = null;
+      }
+      if (isSpinning && !isDecelerating && !isLanding) {
+        beginStop();
+      }
+    }, 40);
   };
 
   const onResize = () => {
@@ -725,6 +741,12 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
   spinnerData.isSpinning = false;
   spinnerData.cleanup = () => {
     active = false;
+    spaceHeld = false;
+    holdStartTs = null;
+    if (releaseTimer != null) {
+      clearTimeout(releaseTimer);
+      releaseTimer = null;
+    }
     window.removeEventListener("keydown", onKeyDown);
     window.removeEventListener("keyup", onKeyUp);
     window.removeEventListener("resize", onResize, true);

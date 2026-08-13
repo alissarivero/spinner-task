@@ -346,6 +346,81 @@ const exp = (function() {
         };
     };
 
+    // Objective "which face is better?" check: feedback + retry until correct
+    const makeCompareCheck = ({
+        question,
+        left,
+        right,
+        choices,
+        buttonHtml,
+        dataExtra = {},
+        feedbackPhase,
+        onLoad,
+        scoreChosen,
+    }) => {
+        let lastCorrect = false;
+        let attempt = 0;
+
+        const compare = {
+            type: jsPsychHtmlButtonResponse,
+            stimulus: `<div class='parent face-compare'>
+                <p><strong>Question ${question}: Which face is better?</strong></p>
+            </div>`,
+            choices,
+            button_html: buttonHtml,
+            margin_horizontal: "48px",
+            data: {
+                training_question: question,
+                left_face: left,
+                right_face: right,
+                ...dataExtra,
+            },
+            on_load: function() {
+                lastCorrect = false;
+                if (typeof onLoad === "function") onLoad();
+            },
+            on_finish: (data) => {
+                attempt += 1;
+                const scored = scoreChosen(data.response);
+                data.chosen_face = scored.chosen_face;
+                data.correct = scored.correct;
+                data.attempt = attempt;
+                lastCorrect = scored.correct;
+            },
+            post_trial_gap: 300,
+        };
+
+        const feedback = {
+            type: jsPsychHtmlButtonResponse,
+            stimulus: function() {
+                const msg = lastCorrect
+                    ? "Correct!"
+                    : "That's not quite right. Try again!";
+                return `<div class="parent face-compare">
+                    <p><strong>${msg}</strong></p>
+                </div>`;
+            },
+            choices: ["Continue"],
+            data: {
+                training_question: question,
+                ...dataExtra,
+            },
+            on_finish: (data) => {
+                data.phase = feedbackPhase;
+                data.correct = lastCorrect;
+                data.attempt = attempt;
+            },
+            post_trial_gap: 300,
+        };
+
+        return {
+            timeline: [compare, feedback],
+            loop_function: function() {
+                return !lastCorrect;
+            },
+        };
+    };
+
     const makeScaleTeach = ({ labels, buttonsHtml, rowClass, phase, onRevealItem }) => ({
         type: jsPsychHtmlKeyboardResponse,
         stimulus: `<div class="parent liking-prompt thumbs-teach-prompt"></div>
@@ -416,33 +491,28 @@ const exp = (function() {
                 rowClass: "happiness-face-row",
                 phase: "happiness_training_scale",
             }),
-            ...happinessCompareItems.map((q) => ({
-                type: jsPsychHtmlButtonResponse,
-                stimulus: `<div class='parent face-compare'>
-                    <p><strong>Question ${q.question}: Which face is better?</strong></p>
-                </div>`,
+            ...happinessCompareItems.map((q) => makeCompareCheck({
+                question: q.question,
+                left: q.left + 1,
+                right: q.right + 1,
                 choices: [happinessLabels[q.left], happinessLabels[q.right]],
-                button_html: [
+                buttonHtml: [
                     happinessFaceButtons[q.left],
                     happinessFaceButtons[q.right],
                 ],
-                margin_horizontal: "48px",
-                data: {
-                    phase: "happiness_training_compare",
-                    training_question: q.question,
-                    left_face: q.left + 1,
-                    right_face: q.right + 1,
-                },
-                on_load: function() {
+                dataExtra: { phase: "happiness_training_compare" },
+                feedbackPhase: "happiness_training_compare_feedback",
+                onLoad: function() {
                     const group = document.getElementById("jspsych-html-button-response-btngroup");
                     if (group) group.classList.add("happiness-face-row");
                 },
-                on_finish: (data) => {
-                    const chosenIdx = [q.left, q.right][data.response];
-                    data.chosen_face = chosenIdx + 1;
-                    data.correct = chosenIdx === Math.max(q.left, q.right);
+                scoreChosen: (response) => {
+                    const chosenIdx = [q.left, q.right][response];
+                    return {
+                        chosen_face: chosenIdx + 1,
+                        correct: chosenIdx === Math.max(q.left, q.right),
+                    };
                 },
-                post_trial_gap: 500,
             })),
             makeHappinessCheck("how_happy_now", "Can you tell me how happy you are right now?"),
         ],
@@ -479,11 +549,11 @@ const exp = (function() {
     };
 
     const faceTrainingItems = [
-        { value: 1, label: "Very bad", face: "./img/Faces/1.png" },
-        { value: 2, label: "Bad", face: "./img/Faces/2.png" },
-        { value: 3, label: "Okay", face: "./img/Faces/3.png" },
-        { value: 4, label: "Good", face: "./img/Faces/4.png" },
-        { value: 5, label: "Very Good", face: "./img/Faces/5.png" },
+        { value: 1, label: "Very bad", face: "./img/New Faces/1.png" },
+        { value: 2, label: "Bad", face: "./img/New Faces/2.png" },
+        { value: 3, label: "Okay", face: "./img/New Faces/3.png" },
+        { value: 4, label: "Good", face: "./img/New Faces/4.png" },
+        { value: 5, label: "Very Good", face: "./img/New Faces/5.png" },
     ];
 
     const prizeFaceButtons = faceTrainingItems.map((item) =>
@@ -521,36 +591,30 @@ const exp = (function() {
         { left: 4, right: 5, question: 3 },
     ];
 
-    const faceCompareTrials = faceCompareItems.map((q) => ({
-        type: jsPsychHtmlButtonResponse,
-        stimulus: `<div class='parent face-compare'>
-            <p><strong>Question ${q.question}: Which face is better?</strong></p>
-        </div>`,
-        choices: [String(q.left), String(q.right)],
-        button_html: [
-            `<button class="jspsych-btn face-choice-btn">
-                <img src="${faceByValue[q.left].face}" alt="Face ${q.left}" class="face-choice-img" />
-            </button>`,
-            `<button class="jspsych-btn face-choice-btn">
-                <img src="${faceByValue[q.right].face}" alt="Face ${q.right}" class="face-choice-img" />
-            </button>`,
-        ],
-        margin_horizontal: "48px",
-        data: {
-            training_question: q.question,
-            left_face: q.left,
-            right_face: q.right,
-        },
-        on_finish: (data) => {
-            const chosen = [q.left, q.right][data.response];
-            data.chosen_face = chosen;
-            data.correct = chosen === Math.max(q.left, q.right);
-        },
-        post_trial_gap: 500,
-    }));
-
     p.faceCompare = {
-        timeline: faceCompareTrials,
+        timeline: faceCompareItems.map((q) => makeCompareCheck({
+            question: q.question,
+            left: q.left,
+            right: q.right,
+            choices: [String(q.left), String(q.right)],
+            buttonHtml: [
+                `<button class="jspsych-btn face-choice-btn">
+                    <img src="${faceByValue[q.left].face}" alt="Face ${q.left}" class="face-choice-img" />
+                </button>`,
+                `<button class="jspsych-btn face-choice-btn">
+                    <img src="${faceByValue[q.right].face}" alt="Face ${q.right}" class="face-choice-img" />
+                </button>`,
+            ],
+            dataExtra: { phase: "prize_face_compare" },
+            feedbackPhase: "prize_face_compare_feedback",
+            scoreChosen: (response) => {
+                const chosen = [q.left, q.right][response];
+                return {
+                    chosen_face: chosen,
+                    correct: chosen === Math.max(q.left, q.right),
+                };
+            },
+        })),
     };
 
     // practice: hold space on black/white alternating wheel
@@ -572,7 +636,7 @@ const exp = (function() {
         show_score_board: false,
         prompt_position: "above",
         score: 0,
-        prompt: `<div class="spin-practice-prompt"><p>Press the <strong>space bar</strong> to spin the wheel. The longer you press, the longer it goes.</p></div>`,
+        prompt: `<div class="spin-practice-prompt"><p>Press and hold the <strong>space bar</strong> to turn the wheel. Release to launch a spin.</p></div>`,
         post_trial_gap: 800,
         data: { phase: "spin_practice" },
     };
@@ -586,11 +650,11 @@ const exp = (function() {
 
     // face wedges (value 1–5)
     const wedges = {
-        one:   { value: 1, color: "#ffffff", face: "./img/Faces/1.png" },
-        two:   { value: 2, color: "#ffffff", face: "./img/Faces/2.png" },
-        three: { value: 3, color: "#ffffff", face: "./img/Faces/3.png" },
-        four:  { value: 4, color: "#ffffff", face: "./img/Faces/4.png" },
-        five:  { value: 5, color: "#ffffff", face: "./img/Faces/5.png" },
+        one:   { value: 1, color: "#ffffff", face: "./img/New Faces/1.png" },
+        two:   { value: 2, color: "#ffffff", face: "./img/New Faces/2.png" },
+        three: { value: 3, color: "#ffffff", face: "./img/New Faces/3.png" },
+        four:  { value: 4, color: "#ffffff", face: "./img/New Faces/4.png" },
+        five:  { value: 5, color: "#ffffff", face: "./img/New Faces/5.png" },
     };
 
     const shuffleSeeded = (arr, seed) => {
@@ -927,16 +991,7 @@ const exp = (function() {
     *
     */
 
-    // Only include pipe save when the CDN plugin loaded (avoids blank page if offline)
-    if (typeof jsPsychPipe !== "undefined") {
-        p.save_data = {
-            type: jsPsychPipe,
-            action: "save",
-            experiment_id: "wBFwbVxNLhxh",
-            filename: filename,
-            data_string: ()=>jsPsych.data.get().csv()
-        };
-    }
+    // CSV is downloaded locally in jsPsych on_finish (see utils.js) — no OSF/DataPipe upload
 
     return p;
 
@@ -965,8 +1020,5 @@ timeline.push(
     exp.outroVideo,
     exp.demographics
 );
-if (exp.save_data) {
-    timeline.push(exp.save_data);
-}
 
 jsPsych.run(timeline);

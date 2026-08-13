@@ -1008,7 +1008,7 @@
   display: block;
   width: 72px;
   height: 88px;
-  background-image: url("../img/thumb%20likert%20scale.png");
+  background-image: url("../img/thumb_likert_bw.png");
   background-repeat: no-repeat;
   background-size: 500% 100%;
 }
@@ -1067,7 +1067,7 @@
   display: block;
   width: 72px;
   height: 72px;
-  background-image: url("../img/happy%20likert%20scale.png");
+  background-image: url("../img/happy_rating_bw.png");
   background-repeat: no-repeat;
   background-size: 500% 100%;
   border-radius: 50%;
