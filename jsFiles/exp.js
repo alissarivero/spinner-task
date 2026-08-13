@@ -549,11 +549,11 @@ const exp = (function() {
     };
 
     const faceTrainingItems = [
-        { value: 1, label: "Very bad", face: "./img/New Faces/1.png" },
-        { value: 2, label: "Bad", face: "./img/New Faces/2.png" },
-        { value: 3, label: "Okay", face: "./img/New Faces/3.png" },
-        { value: 4, label: "Good", face: "./img/New Faces/4.png" },
-        { value: 5, label: "Very Good", face: "./img/New Faces/5.png" },
+        { value: 1, label: "Very bad", face: "./img/new-faces/1.png" },
+        { value: 2, label: "Bad", face: "./img/new-faces/2.png" },
+        { value: 3, label: "Okay", face: "./img/new-faces/3.png" },
+        { value: 4, label: "Good", face: "./img/new-faces/4.png" },
+        { value: 5, label: "Very Good", face: "./img/new-faces/5.png" },
     ];
 
     const prizeFaceButtons = faceTrainingItems.map((item) =>
@@ -650,11 +650,11 @@ const exp = (function() {
 
     // face wedges (value 1–5)
     const wedges = {
-        one:   { value: 1, color: "#ffffff", face: "./img/New Faces/1.png" },
-        two:   { value: 2, color: "#ffffff", face: "./img/New Faces/2.png" },
-        three: { value: 3, color: "#ffffff", face: "./img/New Faces/3.png" },
-        four:  { value: 4, color: "#ffffff", face: "./img/New Faces/4.png" },
-        five:  { value: 5, color: "#ffffff", face: "./img/New Faces/5.png" },
+        one:   { value: 1, color: "#ffffff", face: "./img/new-faces/1.png" },
+        two:   { value: 2, color: "#ffffff", face: "./img/new-faces/2.png" },
+        three: { value: 3, color: "#ffffff", face: "./img/new-faces/3.png" },
+        four:  { value: 4, color: "#ffffff", face: "./img/new-faces/4.png" },
+        five:  { value: 5, color: "#ffffff", face: "./img/new-faces/5.png" },
     };
 
     const shuffleSeeded = (arr, seed) => {
