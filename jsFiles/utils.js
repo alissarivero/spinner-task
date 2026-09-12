@@ -11,35 +11,66 @@ const jsPsych = initJsPsych({
     on_finish: (data) => {
         if (jsPsych.extensions.webgazer) jsPsych.extensions.webgazer.pause();
         data.boot = boot;
-        // download CSV to the browser's Downloads folder
         jsPsych.data.get().localSave("csv", filename);
-        if(!boot) {
-            document.body.innerHTML = 
+        if (!boot) {
+            document.body.innerHTML =
                 `<div align='center' style="margin: 10%">
                     <p>Thank you for participating!<p>
                     <p>Your data file (<strong>${filename}</strong>) has been downloaded.</p>
                     <b>You will be automatically re-directed to Prolific in a few moments.</b>
                 </div>`;
-            setTimeout(() => { 
+            setTimeout(() => {
                 location.href = `https://app.prolific.co/submissions/complete?cc=${completionCode}`
             }, 2000);
         } else {
             document.body.innerHTML =
-                `<div align='center' style="margin: 10%">
+                `<div class="session-done" align='center' style="margin: 10%">
                     <p>Thank you for participating!</p>
                     <p>Your data file (<strong>${filename}</strong>) has been downloaded.</p>
+                    <p>Please keep this window open until the experimenter confirms they have the file.</p>
+                    <button type="button" id="download-again" class="jspsych-btn">Download data again</button>
                 </div>`;
+            const again = document.getElementById("download-again");
+            if (again) {
+                again.addEventListener("click", () => {
+                    jsPsych.data.get().localSave("csv", filename);
+                });
+            }
         }
     },
 });
 
-// set and save subject ID
-let subject_id = jsPsych.data.getURLVariable("PROLIFIC_PID");
-if (!subject_id) { subject_id = jsPsych.randomization.randomID(10) };
-jsPsych.data.addProperties({ subject: subject_id });
+// subject ID and run mode are set on the home screen
+let subject_id = null;
+let filename = "pending.csv";
+let runMode = null;
 
-// define file name
-const filename = `${subject_id}.csv`;
+const setSubject = (id) => {
+    subject_id = String(id).trim();
+    filename = `${subject_id}.csv`;
+    boot = true; // live Zoom / lab session — stay on the thank-you screen, no Prolific redirect
+    jsPsych.data.addProperties({ subject: subject_id, run_mode: runMode });
+};
+
+// Space mutes Zoom if this tab is not focused. Cover the page until they click back.
+const installStudyFocusGuard = () => {
+    if (document.getElementById("study-focus-overlay")) return;
+    const overlay = document.createElement("div");
+    overlay.id = "study-focus-overlay";
+    overlay.innerHTML =
+        "<div class='study-focus-card'>" +
+        "<p><strong>Click this window to continue</strong></p>" +
+        "<p>If Zoom is selected, the space bar will mute your microphone instead of spinning the wheel.</p>" +
+        "</div>";
+    document.body.appendChild(overlay);
+    const sync = () => {
+        overlay.classList.toggle("is-visible", !document.hasFocus());
+    };
+    window.addEventListener("blur", sync);
+    window.addEventListener("focus", sync);
+    overlay.addEventListener("pointerdown", () => window.focus());
+    sync();
+};
 
 // define completion code for Prolific
 const completionCode = "C1ACNNE6";
@@ -340,17 +371,17 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
   const rimWidth = 5;
   const POINTER_DEG = 270; // fixed pointer at top of wheel (canvas degrees, clockwise from east)
 
-  /* spin dynamics — hold = constant pace; release = launch + fixed-duration coast */
+  /* spin dynamics — hold = constant pace; release = launch + friction coast */
   const REF_FPS = 60;
-  const REF_DT = 1 / REF_FPS;
   const MAX_DT = 0.05; // clamp so backgrounded tabs don't jump
   const PACE_VEL = 270; // deg/s — constant moderate rate while space is held
-  const LAUNCH_VEL = 40 * REF_FPS; // deg/s — rapid boost on release
-  const SPIN_DURATION = 4; // seconds from release until stop
-  const angVelMin = 3 * REF_FPS; // deg/s — below stopThresh treated as a stop
+  const FRICTION = 0.975; // per 60fps frame; k = -ln(f)*60
+  const FRICTION_K = -Math.log(FRICTION) * REF_FPS;
+  const STOP_THRESHOLD = 0.05; // deg/s — snap to 0 to end micro-movement
+  const EXTRA_TURNS = 7; // full rotations after release on forced spins
+  // unforced launch matches mid-range forced remaining angle (~7.5 turns)
+  const LAUNCH_VEL = FRICTION_K * (EXTRA_TURNS * 360 + 180) + STOP_THRESHOLD;
   let angVel = 0;    // Current angular velocity (deg/s)
-  let decelLaunchSpeed = 0; // signed launch speed used for post-release ease
-  let decelElapsed = 0; // seconds since release
   let animFrame = null;
   let lastTs = null;
   let spaceHeld = false; // true while space is physically down
@@ -467,7 +498,7 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
   /* state variables */
   let isSpinning = false;      // true when wheel is spinning, false otherwise
   let isAccelerating = false;  // true while space is held (constant pace)
-  let isDecelerating = false;  // true after release (launch + coast-down)
+  let isDecelerating = false;  // true after release (launch + friction coast)
   let isLanding = false;       // true during post-land feedback
   let oldAngle = 0;            // current wheel angle
   let currentAngle = 0;        // wheel angle when stopped
@@ -479,19 +510,16 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     : null;
   let forcedTargetIndex = null; // sector index for current decelerating spin
   let forcedTargetAngle = null; // wheel rotation mod for random point inside that sector
-  const stopThresh = () => angVelMin * 0.1;
-  const residualStep = 1.6 * REF_FPS; // deg/s when creeping into target sector
-  const residualAlignTol = 1.0; // deg — close enough to land
   const wedgeInsetFrac = 0.04; // keep landings slightly inside borders (was 0.15)
-
-  // ease-out speed over fixed spin duration (t in [0, 1])
-  const easedSpeed = (launchSpeed, t) => {
-    const u = Math.max(0, Math.min(1, t));
-    return launchSpeed * Math.pow(1 - u, 2);
-  };
 
   const isForcingThisSpin = () => {
     return !!(forcedValueQueue && forcedValueQueue.length > 0);
+  };
+
+  // remaining rotation over dt under v' = -k v
+  const frictionStep = (vel, dt) => {
+    const nextVel = vel * Math.exp(-FRICTION_K * dt);
+    return { nextVel, delta: (vel - nextVel) / FRICTION_K };
   };
 
   const render = (deg) => {
@@ -505,8 +533,6 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     const sector = Math.floor(onWheel / (360 / tot));
     return ((sector % tot) + tot) % tot;
   };
-
-  const getIndex = () => getIndexAtAngle(currentAngle);
 
   const indicesForValue = (v) => {
     const idxs = [];
@@ -524,22 +550,10 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     return ((POINTER_DEG - onWheel) % 360 + 360) % 360;
   };
 
-  // absolute target angle nearest to predicted (shortest signed delta)
-  const nearestTargetAngle = (predicted, targetMod) => {
-    const predMod = ((predicted % 360) + 360) % 360;
-    const shortest = ((targetMod - predMod + 540) % 360) - 180;
-    return predicted + shortest;
-  };
-
-  // Fixed-step simulation matching post-release ease-out (SPIN_DURATION)
-  const predictFinalAngle = (angle, launchSpeed) => {
-    let a = angle;
-    const steps = Math.ceil(SPIN_DURATION / REF_DT);
-    for (let i = 0; i < steps; i++) {
-      const t = (i * REF_DT) / SPIN_DURATION;
-      a += easedSpeed(launchSpeed, t) * REF_DT;
-    }
-    return a;
+  // forward-only distance (0–360) from current wheel angle to a target mod
+  const forwardDistance = (fromAngle, targetMod) => {
+    const fromMod = ((fromAngle % 360) + 360) % 360;
+    return ((targetMod - fromMod) % 360 + 360) % 360;
   };
 
   const chooseTargetSector = () => {
@@ -551,48 +565,14 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
 
   const setupForcedLanding = () => {
     forcedTargetIndex = chooseTargetSector();
-    if (forcedTargetIndex === null) return;
+    if (forcedTargetIndex === null) {
+      angVel = LAUNCH_VEL;
+      return;
+    }
     forcedTargetAngle = randomSectorModAngle(forcedTargetIndex);
-    // iterative rescales toward the random within-wedge landing point
-    for (let iter = 0; iter < 3; iter++) {
-      const predicted = predictFinalAngle(oldAngle, angVel);
-      const targetAngle = nearestTargetAngle(predicted, forcedTargetAngle);
-      if (Math.abs(targetAngle - predicted) < 2) break;
-      const naturalDelta = predicted - oldAngle;
-      const desiredDelta = targetAngle - oldAngle;
-      if (Math.abs(naturalDelta) <= 1e-3) break;
-      let scale = desiredDelta / naturalDelta;
-      scale = Math.max(0.45, Math.min(1.75, scale));
-      angVel *= scale;
-    }
-  };
-
-  // slow residual roll so forced landings visibly settle on the target (no snap)
-  const residualRollTowardTarget = (dt) => {
-    if (forcedTargetIndex === null || forcedTargetAngle === null) return false;
-    currentAngle = oldAngle;
-    const targetAngle = nearestTargetAngle(oldAngle, forcedTargetAngle);
-    const errAbs = Math.abs(targetAngle - oldAngle);
-    if (getIndex() === forcedTargetIndex && errAbs <= residualAlignTol) return false;
-
-    let err = targetAngle - oldAngle;
-    // keep rolling in the current spin direction when possible
-    const dir = Math.sign(angVel) || Math.sign(err) || 1;
-    if (Math.sign(err) !== 0 && Math.sign(err) !== dir) {
-      // prefer continuing forward to the next equivalent of the target
-      const alt = targetAngle + 360 * dir;
-      if (Math.abs(alt - oldAngle) < Math.abs(err) + 180) {
-        err = alt - oldAngle;
-      }
-    }
-    const step = Math.min(residualStep * dt, Math.abs(err)) * Math.sign(err || dir);
-    oldAngle += step;
-    // keep below stopThresh so next frames stay in residual-roll (not friction) path
-    angVel = stopThresh() * 0.5 * Math.sign(step || 1);
-    currentAngle = oldAngle;
-    render(oldAngle);
-    return getIndex() !== forcedTargetIndex ||
-      Math.abs(nearestTargetAngle(oldAngle, forcedTargetAngle) - oldAngle) > residualAlignTol;
+    const needed = EXTRA_TURNS * 360 + forwardDistance(oldAngle, forcedTargetAngle);
+    // remaining angle as t→∞ is v0/k; add threshold so cutoff still reaches target
+    angVel = FRICTION_K * needed + STOP_THRESHOLD;
   };
 
   const drawSector = (sectorsList, highlightIndex) => {
@@ -743,29 +723,29 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
       return;
     }
 
-    // release: ease from launch speed over fixed SPIN_DURATION
+    // release: friction coast until velocity drops below the stop threshold
     if (!isDecelerating) {
       animFrame = window.requestAnimationFrame(giveMoment);
       return;
     }
 
-    decelElapsed += dt;
-    const t = decelElapsed / SPIN_DURATION;
-    let speed = easedSpeed(decelLaunchSpeed, t);
-    angVel = speed;
+    const step = frictionStep(angVel, dt);
+    oldAngle += step.delta;
+    angVel = step.nextVel;
+    render(oldAngle);
 
-    if (t < 1) {
-      oldAngle += speed * dt;
-      render(oldAngle);
-      animFrame = window.requestAnimationFrame(giveMoment);
-    } else if (forcedTargetIndex !== null && residualRollTowardTarget(dt)) {
-      // creep into the correct wedge without snapping
-      animFrame = window.requestAnimationFrame(giveMoment);
-    } else {
+    if (Math.abs(angVel) < STOP_THRESHOLD) {
+      angVel = 0;
       currentAngle = oldAngle;
       render(oldAngle);
-      landOnSector(getIndex());
+      const idx = forcedTargetIndex != null
+        ? forcedTargetIndex
+        : getIndexAtAngle(oldAngle);
+      landOnSector(idx);
+      return;
     }
+
+    animFrame = window.requestAnimationFrame(giveMoment);
   };
 
   const startSpin = () => {
@@ -776,8 +756,6 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     isDecelerating = false;
     forcedTargetIndex = null;
     forcedTargetAngle = null;
-    decelElapsed = 0;
-    decelLaunchSpeed = 0;
     // resume pacing while still held (e.g. after landing) — start a new hold clock
     if (spaceHeld && holdStartTs == null) {
       holdStartTs = performance.now();
@@ -795,13 +773,11 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     if (spaceHeld) return; // never launch while space is still down
     isAccelerating = false;
     isDecelerating = true;
-    // launch: rapid velocity boost; spin time is fixed (not hold-duration)
-    angVel = LAUNCH_VEL;
-    decelElapsed = 0;
     if (isForcingThisSpin()) {
       setupForcedLanding();
+    } else {
+      angVel = LAUNCH_VEL;
     }
-    decelLaunchSpeed = angVel;
   };
 
   const onKeyDown = (e) => {

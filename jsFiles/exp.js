@@ -33,9 +33,77 @@ const exp = (function() {
     };
 
     p.consent = {
-        type: jsPsychExternalHtml,
-        url: "./html/consent.html",
-        cont_btn: "advance",
+        type: jsPsychHtmlButtonResponse,
+        stimulus: `
+          <div class="parent consent-link-page">
+            <p><strong>Consent form</strong></p>
+            <p>Please read and complete the consent form before you continue.</p>
+            <p><a href="https://duke.qualtrics.com/jfe/form/SV_bBNOJ6f6SgsX0Gi" target="_blank" rel="noopener noreferrer">Open the consent form</a></p>
+          </div>
+        `,
+        choices: ["I have completed the consent form"],
+        data: { phase: "consent" },
+    };
+
+    p.home = {
+        type: jsPsychHtmlKeyboardResponse,
+        stimulus: `
+          <div class="home-entry">
+            <p class="home-entry-title"><strong>Spin the Wheel</strong></p>
+            <ul class="home-entry-zoom">
+              <li>Turn <strong>off your Zoom camera</strong> so this page can use the webcam.</li>
+              <li>Share <strong>this browser window</strong> in Zoom (include computer sound if asked).</li>
+              <li>Keep this window selected. Space bar mutes Zoom if you click back to the Zoom app.</li>
+            </ul>
+            <label class="home-entry-label" for="home-participant-id">Participant number</label>
+            <input id="home-participant-id" class="home-entry-input" type="text" autocomplete="off" />
+            <p id="home-error" class="home-entry-error" hidden>Please enter a participant number.</p>
+            <div class="home-entry-actions">
+              <button type="button" id="home-start" class="jspsych-btn">Start</button>
+              <button type="button" id="home-test" class="jspsych-btn home-entry-test">Skip to wheels (test)</button>
+            </div>
+          </div>
+        `,
+        choices: "NO_KEYS",
+        response_ends_trial: false,
+        data: { phase: "home" },
+        on_load: function() {
+            const input = document.getElementById("home-participant-id");
+            const err = document.getElementById("home-error");
+            const startBtn = document.getElementById("home-start");
+            const testBtn = document.getElementById("home-test");
+            if (!input || !startBtn || !testBtn) return;
+
+            const finish = (mode, id) => {
+                runMode = mode;
+                setSubject(id);
+                installStudyFocusGuard();
+                jsPsych.finishTrial({ phase: "home", run_mode: mode, subject: id });
+            };
+
+            startBtn.addEventListener("click", () => {
+                const id = (input.value || "").trim();
+                if (!id) {
+                    if (err) err.hidden = false;
+                    input.focus();
+                    return;
+                }
+                finish("full", id);
+            });
+
+            testBtn.addEventListener("click", () => {
+                finish("test", "test");
+            });
+
+            input.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") {
+                    e.preventDefault();
+                    startBtn.click();
+                }
+            });
+
+            input.focus();
+        },
     };
 
     p.cameraInstructions = {
@@ -43,6 +111,7 @@ const exp = (function() {
         stimulus: `
           <div class='parent'>
             <p>This study uses your webcam to track where you look on the screen.</p>
+            <p>If you are on Zoom, turn <strong>off your Zoom camera</strong> first. Zoom and this page cannot use the camera at the same time.</p>
             <p>On the next screen, please allow camera access when the browser asks.</p>
             <p>If you do not wish to allow use of your camera, you cannot participate.</p>
             <p>It may take up to 30 seconds for the camera to initialize after you give permission.</p>
@@ -699,7 +768,7 @@ const exp = (function() {
         show_score_board: false,
         prompt_position: "above",
         score: 0,
-        prompt: `<div class="spin-practice-prompt"><p>Press and hold the <strong>space bar</strong> to turn the wheel. Release to launch a spin.</p></div>`,
+        prompt: `<div class="spin-practice-prompt"><p>Click this window, then press and hold the <strong>space bar</strong> to turn the wheel. Release to launch a spin.</p></div>`,
         post_trial_gap: 800,
         data: { phase: "spin_practice" },
     };
@@ -1060,7 +1129,7 @@ const exp = (function() {
 
 }());
 
-const SKIP_CONSENT = true; // set false for real runs / Prolific
+const SKIP_CONSENT = false;
 
 const gazeTargetsFor = (trial) => {
     if (trial.type === jsPsychCanvasButtonResponse) {
@@ -1091,9 +1160,9 @@ const attachGaze = (node) => {
     return next;
 };
 
-const timeline = [];
-if (!SKIP_CONSENT) timeline.push(exp.consent);
-timeline.push(
+const fullPath = [];
+if (!SKIP_CONSENT) fullPath.push(exp.consent);
+fullPath.push(
     exp.cameraInstructions,
     exp.initCamera,
     exp.calibrationInstructions,
@@ -1119,5 +1188,17 @@ timeline.push(
         exp.demographics,
     ])
 );
+
+const timeline = [
+    exp.home,
+    {
+        timeline: fullPath,
+        conditional_function: () => runMode === "full",
+    },
+    {
+        timeline: [exp.task],
+        conditional_function: () => runMode === "test",
+    },
+];
 
 jsPsych.run(timeline);
