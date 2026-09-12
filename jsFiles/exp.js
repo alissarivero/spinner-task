@@ -38,6 +38,69 @@ const exp = (function() {
         cont_btn: "advance",
     };
 
+    p.cameraInstructions = {
+        type: jsPsychHtmlButtonResponse,
+        stimulus: `
+          <div class='parent'>
+            <p>This study uses your webcam to track where you look on the screen.</p>
+            <p>On the next screen, please allow camera access when the browser asks.</p>
+            <p>If you do not wish to allow use of your camera, you cannot participate.</p>
+            <p>It may take up to 30 seconds for the camera to initialize after you give permission.</p>
+          </div>
+        `,
+        choices: ["Got it"],
+        data: { phase: "eyetracking_camera_instructions" },
+    };
+
+    p.initCamera = {
+        type: jsPsychWebgazerInitCamera,
+        data: { phase: "eyetracking_init_camera" },
+    };
+
+    p.calibrationInstructions = {
+        type: jsPsychHtmlButtonResponse,
+        stimulus: `
+          <div class='parent'>
+            <p>Now you'll calibrate the eye tracker so the software can use the image of your eyes to predict where you are looking.</p>
+            <p>You'll see a series of dots appear on the screen. Look at each dot and click on it.</p>
+          </div>
+        `,
+        choices: ["Got it"],
+        data: { phase: "eyetracking_calibration_instructions" },
+    };
+
+    p.calibration = {
+        type: jsPsychWebgazerCalibrate,
+        calibration_points: [
+            [10, 10], [50, 10], [90, 10],
+            [10, 50], [50, 50], [90, 50],
+            [10, 90], [50, 90], [90, 90],
+        ],
+        repetitions_per_point: 1,
+        randomize_calibration_order: true,
+        data: { phase: "eyetracking_calibration" },
+    };
+
+    p.calibrationDone = {
+        type: jsPsychHtmlButtonResponse,
+        stimulus: `
+          <div class='parent'>
+            <p>Great, we're done with calibration!</p>
+            <p>Please keep your head reasonably still for the rest of the study.</p>
+          </div>
+        `,
+        choices: ["OK"],
+        data: { phase: "eyetracking_calibration_done" },
+        on_load: function() {
+            document.body.classList.add("webgazer-hidden");
+            if (jsPsych.extensions.webgazer) {
+                jsPsych.extensions.webgazer.hideVideo();
+                jsPsych.extensions.webgazer.hidePredictions();
+                jsPsych.extensions.webgazer.startMouseCalibration();
+            }
+        },
+    };
+
     // left → right: 1 = Really Don't Like … 5 = Really Like
     const likingLabels = [
         "Really Don't Like",
@@ -999,26 +1062,62 @@ const exp = (function() {
 
 const SKIP_CONSENT = true; // set false for real runs / Prolific
 
+const gazeTargetsFor = (trial) => {
+    if (trial.type === jsPsychCanvasButtonResponse) {
+        return ["#jspsych-canvas-stimulus"];
+    }
+    if (trial.type === jsPsychHtmlButtonResponse) {
+        return ["#jspsych-html-button-response-btngroup"];
+    }
+    const stim = typeof trial.stimulus === "string" ? trial.stimulus : "";
+    const targets = [];
+    if (stim.indexOf('id="intro-video"') !== -1) targets.push("#intro-video");
+    if (stim.indexOf('id="outro-video"') !== -1) targets.push("#outro-video");
+    return targets;
+};
+
+const attachGaze = (node) => {
+    if (Array.isArray(node)) return node.map(attachGaze);
+    if (!node || typeof node !== "object") return node;
+    const next = Object.assign({}, node);
+    if (next.timeline) next.timeline = attachGaze(next.timeline);
+    if (next.type) {
+        const existing = next.extensions || [];
+        next.extensions = existing.concat([{
+            type: jsPsychExtensionWebgazer,
+            params: { targets: gazeTargetsFor(next) },
+        }]);
+    }
+    return next;
+};
+
 const timeline = [];
 if (!SKIP_CONSENT) timeline.push(exp.consent);
 timeline.push(
-    exp.introVideo,
-    exp.happinessTraining,
-    exp.thumbsTraining,
-    exp.spinLearnTransition,
-    exp.spinPractice,
-    exp.playGameTransition,
-    exp.introVideo,
-    exp.intro,
-    exp.facesTransition,
-    exp.faceTraining,
-    exp.faceCompare,
-    exp.task,
-    exp.chooseTransition,
-    exp.bonusChoice,
-    exp.bonusSpin,
-    exp.outroVideo,
-    exp.demographics
+    exp.cameraInstructions,
+    exp.initCamera,
+    exp.calibrationInstructions,
+    exp.calibration,
+    exp.calibrationDone,
+    ...attachGaze([
+        exp.introVideo,
+        exp.happinessTraining,
+        exp.thumbsTraining,
+        exp.spinLearnTransition,
+        exp.spinPractice,
+        exp.playGameTransition,
+        exp.introVideo,
+        exp.intro,
+        exp.facesTransition,
+        exp.faceTraining,
+        exp.faceCompare,
+        exp.task,
+        exp.chooseTransition,
+        exp.bonusChoice,
+        exp.bonusSpin,
+        exp.outroVideo,
+        exp.demographics,
+    ])
 );
 
 jsPsych.run(timeline);

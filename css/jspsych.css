@@ -612,6 +612,7 @@
   z-index: 1;
   display: block;
   border-radius: 50%;
+  transform-origin: 50% 50%;
   box-shadow:
     0 6px 18px rgba(0, 0, 0, 0.28),
     0 2px 6px rgba(0, 0, 0, 0.18);
@@ -1244,5 +1245,48 @@
 
 .thumbs-confirm p {
   font-size: 22px;
+}
+
+/* hide WebGazer video / gaze overlay after calibration */
+body.webgazer-hidden #webgazerVideoContainer,
+body.webgazer-hidden #webgazerGazeDot {
+  display: none !important;
+}
+
+/* faint spin distractors — peripheral, low contrast */
+#spin-distractors {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 40;
+}
+
+.spin-distractor {
+  position: absolute;
+  box-sizing: border-box;
+  background: #8f8f8f;
+  opacity: 0;
+  transition: opacity 0.45s ease;
+  pointer-events: none;
+}
+
+.spin-distractor.is-visible {
+  opacity: 0.42;
+}
+
+.spin-distractor-circle {
+  border-radius: 50%;
+}
+
+.spin-distractor-square {
+  border-radius: 2px;
+}
+
+.spin-distractor-triangle {
+  clip-path: polygon(50% 0, 100% 100%, 0 100%);
+}
+
+.spin-distractor-diamond {
+  clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%);
 }
 

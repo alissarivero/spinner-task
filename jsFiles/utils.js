@@ -1,7 +1,15 @@
 
+// independent WebGazer sessions — do not restore prior IndexedDB training
+window.saveDataAcrossSessions = false;
+
 // initialize jsPsych
 const jsPsych = initJsPsych({
+    extensions: [{
+        type: jsPsychExtensionWebgazer,
+        params: { round_predictions: true, sampling_interval: 34 },
+    }],
     on_finish: (data) => {
+        if (jsPsych.extensions.webgazer) jsPsych.extensions.webgazer.pause();
         data.boot = boot;
         // download CSV to the browser's Downloads folder
         jsPsych.data.get().localSave("csv", filename);
@@ -353,6 +361,108 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
   if (!Array.isArray(spinnerData.hold_durations)) {
     spinnerData.hold_durations = [];
   }
+  if (!Array.isArray(spinnerData.distractors)) {
+    spinnerData.distractors = [];
+  }
+
+  /* faint peripheral shapes during spins (low-contrast, one at a time) */
+  const spinnerStartTs = performance.now();
+  const DISTRACTOR_KINDS = ["circle", "square", "triangle", "diamond"];
+  const DISTRACTOR_SLOTS = [
+    [0.88, 0.14], [0.90, 0.40], [0.88, 0.82],
+    [0.12, 0.40], [0.12, 0.82], [0.70, 0.12], [0.30, 0.88],
+  ];
+  let distractorLayer = document.getElementById("spin-distractors");
+  if (!distractorLayer) {
+    distractorLayer = document.createElement("div");
+    distractorLayer.id = "spin-distractors";
+    distractorLayer.setAttribute("aria-hidden", "true");
+    document.body.appendChild(distractorLayer);
+  }
+  const distractorEl = document.createElement("div");
+  distractorEl.className = "spin-distractor";
+  distractorLayer.appendChild(distractorEl);
+  let distractorTimer = null;
+  let currentDistractor = null;
+
+  const hideDistractor = (immediate) => {
+    if (currentDistractor && currentDistractor.hidden_at == null) {
+      currentDistractor.hidden_at = Math.round(performance.now() - spinnerStartTs);
+    }
+    currentDistractor = null;
+    distractorEl.classList.remove("is-visible");
+    if (immediate) distractorEl.style.opacity = "0";
+  };
+
+  const pickDistractorSlot = () => {
+    const wheel = canvas.getBoundingClientRect();
+    const cx = wheel.x + wheel.width / 2;
+    const cy = wheel.y + wheel.height / 2;
+    const minDist = Math.max(wheel.width, 240) * 0.72;
+    const order = DISTRACTOR_SLOTS.slice();
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [order[i], order[j]] = [order[j], order[i]];
+    }
+    for (let i = 0; i < order.length; i++) {
+      const x = order[i][0] * window.innerWidth;
+      const y = order[i][1] * window.innerHeight;
+      const dx = x - cx;
+      const dy = y - cy;
+      if (Math.sqrt(dx * dx + dy * dy) >= minDist) return { x, y };
+    }
+    return {
+      x: DISTRACTOR_SLOTS[0][0] * window.innerWidth,
+      y: DISTRACTOR_SLOTS[0][1] * window.innerHeight,
+    };
+  };
+
+  const showDistractor = () => {
+    if (!active || !isSpinning || isLanding) return;
+    const kind = DISTRACTOR_KINDS[Math.floor(Math.random() * DISTRACTOR_KINDS.length)];
+    const slot = pickDistractorSlot();
+    const size = Math.round(rand(22, 30));
+    distractorEl.className = "spin-distractor spin-distractor-" + kind;
+    distractorEl.style.width = size + "px";
+    distractorEl.style.height = size + "px";
+    distractorEl.style.left = Math.round(slot.x - size / 2) + "px";
+    distractorEl.style.top = Math.round(slot.y - size / 2) + "px";
+    distractorEl.style.opacity = "";
+    void distractorEl.offsetWidth;
+    distractorEl.classList.add("is-visible");
+    currentDistractor = {
+      shape: kind,
+      x: Math.round(slot.x),
+      y: Math.round(slot.y),
+      size,
+      shown_at: Math.round(performance.now() - spinnerStartTs),
+      hidden_at: null,
+      n_spins: spinnerData.outcomes.length,
+    };
+    spinnerData.distractors.push(currentDistractor);
+  };
+
+  const stopDistractors = (immediate) => {
+    if (distractorTimer != null) {
+      clearTimeout(distractorTimer);
+      distractorTimer = null;
+    }
+    hideDistractor(immediate);
+  };
+
+  const scheduleNextDistractor = () => {
+    if (!active || !isSpinning || isLanding) return;
+    distractorTimer = setTimeout(() => {
+      distractorTimer = null;
+      showDistractor();
+      const visibleFor = rand(900, 1600);
+      distractorTimer = setTimeout(() => {
+        distractorTimer = null;
+        hideDistractor(false);
+        scheduleNextDistractor();
+      }, visibleFor);
+    }, rand(800, 2000));
+  };
 
   /* state variables */
   let isSpinning = false;      // true when wheel is spinning, false otherwise
@@ -513,17 +623,16 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
       ctx.rotate((ang + arc / 2) + arc);
       const faceSrc = sectorsList[i].face;
       const img = faceSrc ? faceImages[faceSrc] : null;
-      const size = (isSpinning && i === highlightIndex) ? faceSize * 1.25 : faceSize;
       const faceRadius = faceOffsetY * (drawRadius / rad);
       if (img && img.complete) {
         if (isSpinning && i === highlightIndex) {
           ctx.beginPath();
           ctx.strokeStyle = "#000";
           ctx.lineWidth = 6;
-          ctx.arc(0, faceRadius, size / 2 + 4, 0, 2 * PI);
+          ctx.arc(0, faceRadius, faceSize / 2 + 4, 0, 2 * PI);
           ctx.stroke();
         }
-        ctx.drawImage(img, -size / 2, faceRadius - size / 2, size, size);
+        ctx.drawImage(img, -faceSize / 2, faceRadius - faceSize / 2, faceSize, faceSize);
       }
       ctx.restore();
     }
@@ -603,6 +712,7 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     if (sector.value === 1 || sector.value === 2 || sector.value === 4 || sector.value === 5) {
       playFaceSound(sector.value);
     }
+    stopDistractors(false);
     updateScore(sector.value, sector.color, sector.face);
     if (forcedValueQueue && forcedValueQueue.length > 0) {
       forcedValueQueue.shift();
@@ -675,6 +785,8 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     spinnerData.isSpinning = true;
     lastTs = null;
     angVel = PACE_VEL;
+    stopDistractors(true);
+    scheduleNextDistractor();
     animFrame = window.requestAnimationFrame(giveMoment);
   };
 
@@ -752,6 +864,11 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     window.removeEventListener("resize", onResize, true);
     if (animFrame) window.cancelAnimationFrame(animFrame);
     if (stopConfetti) stopConfetti();
+    stopDistractors(true);
+    if (distractorEl.parentNode) distractorEl.remove();
+    if (distractorLayer && distractorLayer.childElementCount === 0) {
+      distractorLayer.remove();
+    }
   };
 
   preloadFaceImages(sectors).then(() => {
