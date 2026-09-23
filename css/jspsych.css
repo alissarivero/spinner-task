@@ -1338,6 +1338,50 @@ body.webgazer-hidden #webgazerGazeDot {
   display: none !important;
 }
 
+/* calibration animals — centered on the WebGazer point */
+.calibration-animal {
+  position: absolute;
+  width: 88px;
+  height: 88px;
+  transform: translate(-50%, -50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.calibration-animal-face {
+  font-size: 64px;
+  line-height: 1;
+  animation: calibration-animal-in 0.35s ease-out, calibration-animal-bob 1.4s ease-in-out 0.35s infinite;
+}
+
+@keyframes calibration-animal-in {
+  from { transform: scale(0.2); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+@keyframes calibration-animal-bob {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.1); }
+}
+
+.calibration-pop {
+  position: fixed;
+  transform: translate(-50%, -50%);
+  font-size: 44px;
+  pointer-events: none;
+  z-index: 9999;
+  animation: calibration-pop 0.7s ease-out forwards;
+}
+
+@keyframes calibration-pop {
+  from { transform: translate(-50%, -50%) scale(0.6); opacity: 1; }
+  to { transform: translate(-50%, -120%) scale(1.4); opacity: 0; }
+}
+
 /* faint spin distractors — peripheral, low contrast */
 #spin-distractors {
   position: fixed;

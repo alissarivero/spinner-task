@@ -2,42 +2,238 @@
 // independent WebGazer sessions — do not restore prior IndexedDB training
 window.saveDataAcrossSessions = false;
 
+// PLACEHOLDER: where session data is sent. Nothing is saved until this is set.
+// Data is never downloaded onto the participant's computer.
+const DATA_UPLOAD_URL = null;
+
+const uploadSessionData = async (csv, name) => {
+    if (!DATA_UPLOAD_URL) {
+        throw new Error("No data upload destination is set (DATA_UPLOAD_URL in jsFiles/utils.js).");
+    }
+    const res = await fetch(DATA_UPLOAD_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: name, data: csv }),
+    });
+    if (!res.ok) throw new Error(`Upload failed with status ${res.status}`);
+};
+
+/*
+ * Session CSV: one event per row, identified by row_type.
+ *   trial - one per screen (answers; wheel screens add score and needle/wheel geometry)
+ *   spin  - one per rotation of a wheel
+ *   shape - one per distractor shape shown during a wheel
+ *   gaze  - one per WebGazer sample on a wheel
+ * Spin, shape, and gaze times are ms on that trial's webgazer_data clock.
+ * Positions are viewport pixels, the same space as gaze_x / gaze_y. The page
+ * layout is logged whenever it changes (resize, zoom, scroll, tray growth), and
+ * each spin and gaze sample uses the layout on screen at that moment. *_norm
+ * columns are the same position as a fraction of the viewport (0-1).
+ */
+const LAYOUT_FIELDS = [
+    "viewport_w", "viewport_h",
+    "needle_x", "needle_y", "needle_w", "needle_h", "wheel_x", "wheel_y", "wheel_r",
+];
+const CSV_TRIAL_FIELDS = [
+    // identity
+    "subject", "run_mode", "trial_index", "trial_type", "phase", "time_elapsed", "internal_node_id",
+    // device and browser
+    "screen_w", "screen_h", "device_pixel_ratio", "user_agent",
+    // design
+    "spinner_type", "round", "order", "bonus_round", "order_perm", "chosen_spinner",
+    "high_outcome_order", "medium_outcome_order", "half51_outcome_order",
+    // answers
+    "rt", "response", "liking", "liking_label", "flow", "happiness", "happiness_label",
+    "training_question", "left_face", "right_face", "chosen_face", "correct", "attempt", "confirmed",
+    "happiness_training_q", "thumbs_training_q", "load_time", "view_history",
+    "gender", "age", "ethnicity", "english", "finalWord",
+    // wheel screen (layout at the start of the wheel)
+    "score", "n_spins",
+].concat(LAYOUT_FIELDS);
+const CSV_COLUMNS = ["row_type"].concat(
+    CSV_TRIAL_FIELDS,
+    ["spin_index", "t_start", "t_release", "t_land", "hold_ms", "outcome", "resumed"],
+    ["shape_index", "shape", "shape_x", "shape_y", "shape_x_norm", "shape_y_norm", "shape_size",
+     "t_on", "t_off", "spins_landed"],
+    ["t", "gaze_x", "gaze_y", "gaze_x_norm", "gaze_y_norm", "dist_needle", "on_needle", "on_wheel",
+     "spinning", "shape_visible", "ms_from_onset", "dist_shape"],
+);
+
+// layout on screen at trial time t (the first one if t precedes every entry)
+const layoutAt = (layouts, t) => {
+    let current = layouts[0] || null;
+    for (const layout of layouts) {
+        if (layout.t <= t) current = layout;
+        else break;
+    }
+    return current;
+};
+
+const norm = (value, size) => (size ? Math.round((value / size) * 10000) / 10000 : null);
+
+// gaze within this many px of the needle box still counts as on the needle
+const NEEDLE_PAD = 24;
+
+const csvCell = (value) => {
+    if (value === undefined || value === null) return '""';
+    const text = typeof value === "object" ? JSON.stringify(value) : String(value);
+    return '"' + text.replace(/"/g, '""') + '"';
+};
+
+const eventRows = (trial) => {
+    const base = {
+        subject: trial.subject,
+        trial_index: trial.trial_index,
+        phase: trial.phase,
+        spinner_type: trial.spinner_type,
+        round: trial.round,
+    };
+    const rows = [];
+    const spins = trial.spins || [];
+    const shapes = trial.distractors || [];
+    const layouts = trial.layouts || [];
+
+    spins.forEach((s, i) => {
+        const row = Object.assign({ row_type: "spin" }, base, {
+            spin_index: i + 1,
+            t_start: s.t_start,
+            t_release: s.t_release,
+            t_land: s.t_land,
+            hold_ms: s.hold_ms,
+            outcome: s.outcome,
+            resumed: s.resumed,
+        });
+        const layout = layoutAt(layouts, s.t_start);
+        if (layout) LAYOUT_FIELDS.forEach((key) => { row[key] = layout[key]; });
+        rows.push(row);
+    });
+
+    const shapeFields = (d) => {
+        const layout = layoutAt(layouts, d.t_on);
+        return {
+            shape: d.shape,
+            shape_x: d.x,
+            shape_y: d.y,
+            shape_x_norm: layout ? norm(d.x, layout.viewport_w) : null,
+            shape_y_norm: layout ? norm(d.y, layout.viewport_h) : null,
+            shape_size: d.size,
+        };
+    };
+
+    shapes.forEach((d, i) => {
+        const row = Object.assign({ row_type: "shape" }, base, { shape_index: i + 1 }, shapeFields(d), {
+            t_on: d.t_on,
+            t_off: d.t_off,
+            spins_landed: d.n_spins,
+        });
+        const layout = layoutAt(layouts, d.t_on);
+        if (layout) {
+            row.viewport_w = layout.viewport_w;
+            row.viewport_h = layout.viewport_h;
+        }
+        rows.push(row);
+    });
+
+    const dist = (x1, y1, x2, y2) => Math.round(Math.hypot(x1 - x2, y1 - y2));
+
+    (trial.webgazer_data || []).forEach((g) => {
+        const row = Object.assign({ row_type: "gaze" }, base, { t: g.t, gaze_x: g.x, gaze_y: g.y });
+        const layout = layoutAt(layouts, g.t);
+
+        if (layout) {
+            row.viewport_w = layout.viewport_w;
+            row.viewport_h = layout.viewport_h;
+            row.gaze_x_norm = norm(g.x, layout.viewport_w);
+            row.gaze_y_norm = norm(g.y, layout.viewport_h);
+        }
+        if (layout && layout.needle_x != null) {
+            row.dist_needle = dist(g.x, g.y, layout.needle_x, layout.needle_y);
+            const halfW = layout.needle_w / 2 + NEEDLE_PAD;
+            const halfH = layout.needle_h / 2 + NEEDLE_PAD;
+            row.on_needle = Math.abs(g.x - layout.needle_x) <= halfW && Math.abs(g.y - layout.needle_y) <= halfH ? 1 : 0;
+        }
+        if (layout && layout.wheel_x != null) {
+            row.on_wheel = dist(g.x, g.y, layout.wheel_x, layout.wheel_y) <= layout.wheel_r ? 1 : 0;
+        }
+
+        const spinIdx = spins.findIndex((s) => g.t >= s.t_start && g.t <= (s.t_land != null ? s.t_land : Infinity));
+        row.spinning = spinIdx >= 0 ? 1 : 0;
+        if (spinIdx >= 0) row.spin_index = spinIdx + 1;
+
+        // a sample belongs to a shape from the previous shape's hide until this one hides
+        const shapeIdx = shapes.findIndex((d) => g.t <= (d.t_off != null ? d.t_off : Infinity));
+        if (shapeIdx >= 0) {
+            const d = shapes[shapeIdx];
+            row.shape_index = shapeIdx + 1;
+            Object.assign(row, shapeFields(d));
+            row.shape_visible = g.t >= d.t_on && g.t <= (d.t_off != null ? d.t_off : Infinity) ? 1 : 0;
+            row.ms_from_onset = g.t - d.t_on;
+            row.dist_shape = dist(g.x, g.y, d.x, d.y);
+        }
+        rows.push(row);
+    });
+
+    return rows;
+};
+
+const buildSessionCsv = (trials) => {
+    const rows = [];
+    trials.forEach((trial) => {
+        const row = { row_type: "trial" };
+        CSV_TRIAL_FIELDS.forEach((key) => { row[key] = trial[key]; });
+        const firstLayout = (trial.layouts || [])[0];
+        if (firstLayout) LAYOUT_FIELDS.forEach((key) => { row[key] = firstLayout[key]; });
+        rows.push(row);
+        if (Array.isArray(trial.spins)) rows.push(...eventRows(trial));
+    });
+    const lines = [CSV_COLUMNS.map(csvCell).join(",")];
+    rows.forEach((row) => lines.push(CSV_COLUMNS.map((key) => csvCell(row[key])).join(",")));
+    return lines.join("\r\n") + "\r\n";
+};
+
 // initialize jsPsych
 const jsPsych = initJsPsych({
     extensions: [{
         type: jsPsychExtensionWebgazer,
         params: { round_predictions: true, sampling_interval: 34 },
     }],
-    on_finish: (data) => {
+    // runs once, after the demographic questions — the only point data is saved
+    on_finish: () => {
         if (jsPsych.extensions.webgazer) jsPsych.extensions.webgazer.pause();
-        data.boot = boot;
-        jsPsych.data.get().localSave("csv", filename);
-        if (!boot) {
-            document.body.innerHTML =
-                `<div align='center' style="margin: 10%">
-                    <p>Thank you for participating!<p>
-                    <p>Your data file (<strong>${filename}</strong>) has been downloaded.</p>
-                    <b>You will be automatically re-directed to Prolific in a few moments.</b>
-                </div>`;
-            setTimeout(() => {
-                location.href = `https://app.prolific.co/submissions/complete?cc=${completionCode}`
-            }, 2000);
-        } else {
-            document.body.innerHTML =
-                `<div class="session-done" align='center' style="margin: 10%">
-                    <p>Thank you for participating!</p>
-                    <p>Your data file (<strong>${filename}</strong>) has been downloaded.</p>
-                    <p>Please keep this window open until the experimenter confirms they have the file.</p>
-                    <button type="button" id="download-again" class="jspsych-btn">Download data again</button>
-                </div>`;
-            const again = document.getElementById("download-again");
-            if (again) {
-                again.addEventListener("click", () => {
-                    jsPsych.data.get().localSave("csv", filename);
+        const csv = buildSessionCsv(jsPsych.data.get().values());
+        document.body.innerHTML =
+            `<div class="session-done" align='center' style="margin: 10%">
+                <p>Thank you for participating!</p>
+                <p id="save-status">Saving your data...</p>
+                <p>Please keep this window open until the experimenter confirms your data was saved.</p>
+                <button type="button" id="save-again" class="jspsych-btn" hidden>Try saving again</button>
+            </div>`;
+        const status = document.getElementById("save-status");
+        const again = document.getElementById("save-again");
+        const save = () => {
+            status.textContent = "Saving your data...";
+            again.hidden = true;
+            uploadSessionData(csv, filename)
+                .then(() => {
+                    status.textContent = "Your data has been saved.";
+                })
+                .catch((err) => {
+                    console.error(err);
+                    status.textContent = "Your data could not be saved. Please tell the experimenter.";
+                    again.hidden = false;
                 });
-            }
-        }
+        };
+        again.addEventListener("click", save);
+        save();
     },
+});
+
+// device_pixel_ratio also reflects browser zoom when the page opened
+jsPsych.data.addProperties({
+    screen_w: window.screen.width,
+    screen_h: window.screen.height,
+    device_pixel_ratio: window.devicePixelRatio,
+    user_agent: navigator.userAgent,
 });
 
 // subject ID and run mode are set on the home screen
@@ -48,7 +244,6 @@ let runMode = null;
 const setSubject = (id) => {
     subject_id = String(id).trim();
     filename = `${subject_id}.csv`;
-    boot = true; // live Zoom / lab session — stay on the thank-you screen, no Prolific redirect
     jsPsych.data.addProperties({ subject: subject_id, run_mode: runMode });
 };
 
@@ -71,12 +266,6 @@ const installStudyFocusGuard = () => {
     overlay.addEventListener("pointerdown", () => window.focus());
     sync();
 };
-
-// define completion code for Prolific
-const completionCode = "C1ACNNE6";
-
-// when true, boot participant from study without redirecting to Prolific
-let boot = false;
 
 // function for saving survey data in wide format
 const saveSurveyData = (data) => {
@@ -205,6 +394,98 @@ const playFaceSound = (value) => {
 };
 
 const playCelebrateSound = () => playFaceSound(5);
+
+// short rising "boop" when a calibration animal is tapped
+const playPopSound = () => {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    if (!faceAudioCtx) faceAudioCtx = new AC();
+    const ctx = faceAudioCtx;
+    const schedule = () => {
+      const t0 = ctx.currentTime;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(520, t0);
+      osc.frequency.exponentialRampToValueAtTime(1040, t0 + 0.12);
+      gain.gain.setValueAtTime(0, t0);
+      gain.gain.linearRampToValueAtTime(0.18, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.25);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t0);
+      osc.stop(t0 + 0.3);
+    };
+    if (ctx.state === "suspended") {
+      ctx.resume().then(schedule).catch(() => {});
+    } else {
+      schedule();
+    }
+  } catch (_) { /* ignore audio failures */ }
+};
+
+// Calibration: dress each WebGazer point up as a cute animal.
+// The plugin still owns the point element and its click handler; WebGazer
+// learns from the actual click position, so the animal is centered on the spot.
+// escaped so they render even when the page is served without a UTF-8 charset
+// dog, cat, rabbit, panda, koala, fox, frog, monkey, pig, tiger, lion, penguin
+const CALIBRATION_ANIMALS = [
+  "\u{1F436}", "\u{1F431}", "\u{1F430}", "\u{1F43C}", "\u{1F428}", "\u{1F98A}",
+  "\u{1F438}", "\u{1F435}", "\u{1F437}", "\u{1F42F}", "\u{1F981}", "\u{1F427}",
+];
+
+const startAnimalCalibration = () => {
+  const container = document.getElementById("webgazer-calibrate-container");
+  if (!container) return () => {};
+
+  const animals = CALIBRATION_ANIMALS.slice();
+  for (let i = animals.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [animals[i], animals[j]] = [animals[j], animals[i]];
+  }
+  let next = 0;
+
+  const decorate = () => {
+    const point = container.querySelector("#calibration-point");
+    if (!point || point.classList.contains("calibration-animal")) return;
+    const { left, top } = point.style;
+    point.style.cssText = `left:${left};top:${top};`;
+    point.className = "calibration-animal";
+    const face = document.createElement("span");
+    face.className = "calibration-animal-face";
+    face.textContent = animals[next % animals.length];
+    next += 1;
+    point.appendChild(face);
+  };
+
+  const burst = (x, y) => {
+    const pop = document.createElement("div");
+    pop.className = "calibration-pop";
+    pop.style.left = `${x}px`;
+    pop.style.top = `${y}px`;
+    pop.textContent = "\u2728"; // sparkles
+    document.body.appendChild(pop);
+    setTimeout(() => pop.remove(), 700);
+  };
+
+  const onClick = (e) => {
+    if (!e.target.closest || !e.target.closest(".calibration-animal")) return;
+    burst(e.clientX, e.clientY);
+    playPopSound();
+  };
+
+  // capture phase: the last point's own click handler ends the trial (and this cleanup)
+  const observer = new MutationObserver(decorate);
+  observer.observe(container, { childList: true });
+  container.addEventListener("click", onClick, true);
+  decorate();
+
+  return () => {
+    observer.disconnect();
+    container.removeEventListener("click", onClick, true);
+  };
+};
 
 // green confetti burst for landing on 5
 const launchGreenConfetti = () => {
@@ -395,14 +676,63 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
   if (!Array.isArray(spinnerData.distractors)) {
     spinnerData.distractors = [];
   }
+  if (!Array.isArray(spinnerData.spins)) {
+    spinnerData.spins = [];
+  }
+  let currentSpin = null;
+
+  const spinnerStartTs = performance.now();
+
+  // Event times share webgazer_data's clock: ms from the WebGazer extension's
+  // on_load for this trial. Without gaze (test mode), ms from wheel creation.
+  const toTrialClock = (ts) => {
+    const wg = jsPsych.extensions && jsPsych.extensions.webgazer;
+    const start = wg && wg.currentTrialStart >= spinnerStartTs ? wg.currentTrialStart : spinnerStartTs;
+    return Math.round(ts - start);
+  };
+
+  // Where the needle and wheel are depends on window size, zoom, scrolling, and
+  // the collected-faces tray above the wheel, so the layout is re-measured and a
+  // new entry is logged (with its time) whenever any of it changes.
+  // needle: #spin is a zero-size anchor on the rim; its red ::after flapper is
+  // rotated 180deg about that anchor, so it hangs straight down from it
+  if (!Array.isArray(spinnerData.layouts)) {
+    spinnerData.layouts = [];
+  }
+  const measureGeometry = () => {
+    if (!canvas.isConnected) return;
+    const layout = { viewport_w: window.innerWidth, viewport_h: window.innerHeight };
+    const needle = document.getElementById("spin");
+    if (needle) {
+      const anchor = needle.getBoundingClientRect();
+      const flapper = getComputedStyle(needle, "::after");
+      const w = parseFloat(flapper.width) || 44;
+      const h = parseFloat(flapper.height) || 40;
+      layout.needle_x = Math.round(anchor.left);
+      layout.needle_y = Math.round(anchor.top + h / 2);
+      layout.needle_w = Math.round(w);
+      layout.needle_h = Math.round(h);
+    }
+    // the canvas rotates about its center, so its rect center is stable
+    const box = canvas.getBoundingClientRect();
+    layout.wheel_x = Math.round(box.left + box.width / 2);
+    layout.wheel_y = Math.round(box.top + box.height / 2);
+    layout.wheel_r = Math.round((canvas.offsetWidth / 2) * ((drawRadius + rimWidth / 2) / rad));
+
+    const last = spinnerData.layouts[spinnerData.layouts.length - 1];
+    if (last && LAYOUT_FIELDS.every((key) => last[key] === layout[key])) return;
+    layout.t = toTrialClock(performance.now());
+    spinnerData.layouts.push(layout);
+  };
+  measureGeometry();
 
   /* faint peripheral shapes during spins (low-contrast, one at a time) */
-  const spinnerStartTs = performance.now();
   const DISTRACTOR_KINDS = ["circle", "square", "triangle", "diamond"];
-  const DISTRACTOR_SLOTS = [
-    [0.88, 0.14], [0.90, 0.40], [0.88, 0.82],
-    [0.12, 0.40], [0.12, 0.82], [0.70, 0.12], [0.30, 0.88],
-  ];
+  const DISTRACTOR_EDGE = 30;      // px kept clear of the viewport edge
+  const DISTRACTOR_WHEEL_GAP = 50; // px kept clear outside the wheel rim
+  const DISTRACTOR_TRAY_GAP = 30;  // px kept clear around the collected-faces tray
+  const DISTRACTOR_MIN_MOVE = 200; // px from the previous shape's spot
+  let lastDistractorSpot = null;
   let distractorLayer = document.getElementById("spin-distractors");
   if (!distractorLayer) {
     distractorLayer = document.createElement("div");
@@ -417,42 +747,58 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
   let currentDistractor = null;
 
   const hideDistractor = (immediate) => {
-    if (currentDistractor && currentDistractor.hidden_at == null) {
-      currentDistractor.hidden_at = Math.round(performance.now() - spinnerStartTs);
+    if (currentDistractor && currentDistractor.t_off == null) {
+      currentDistractor.t_off = toTrialClock(performance.now());
     }
     currentDistractor = null;
     distractorEl.classList.remove("is-visible");
     if (immediate) distractorEl.style.opacity = "0";
   };
 
-  const pickDistractorSlot = () => {
+  const pickDistractorSlot = (size) => {
+    // rect center is stable under rotation, but the rotated rect is wider than
+    // the wheel, so the keep-out radius uses the unrotated layout width
     const wheel = canvas.getBoundingClientRect();
     const cx = wheel.x + wheel.width / 2;
     const cy = wheel.y + wheel.height / 2;
-    const minDist = Math.max(wheel.width, 240) * 0.72;
-    const order = DISTRACTOR_SLOTS.slice();
-    for (let i = order.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [order[i], order[j]] = [order[j], order[i]];
+    const half = size / 2;
+    const wheelKeepOut = canvas.offsetWidth / 2 + DISTRACTOR_WHEEL_GAP + half;
+    const tray = collectedFacesEl ? collectedFacesEl.getBoundingClientRect() : null;
+    const trayPad = DISTRACTOR_TRAY_GAP + half;
+    const inTray = (x, y) => tray && tray.width > 0 &&
+      x > tray.left - trayPad && x < tray.right + trayPad &&
+      y > tray.top - trayPad && y < tray.bottom + trayPad;
+    const minX = DISTRACTOR_EDGE + half;
+    const maxX = window.innerWidth - DISTRACTOR_EDGE - half;
+    const minY = DISTRACTOR_EDGE + half;
+    const maxY = window.innerHeight - DISTRACTOR_EDGE - half;
+    let fallback = null;
+    for (let i = 0; i < 300; i++) {
+      const x = rand(minX, maxX);
+      const y = rand(minY, maxY);
+      if (Math.hypot(x - cx, y - cy) < wheelKeepOut || inTray(x, y)) continue;
+      if (!lastDistractorSpot ||
+          Math.hypot(x - lastDistractorSpot.x, y - lastDistractorSpot.y) >= DISTRACTOR_MIN_MOVE) {
+        return { x, y };
+      }
+      if (!fallback) fallback = { x, y };
     }
-    for (let i = 0; i < order.length; i++) {
-      const x = order[i][0] * window.innerWidth;
-      const y = order[i][1] * window.innerHeight;
-      const dx = x - cx;
-      const dy = y - cy;
-      if (Math.sqrt(dx * dx + dy * dy) >= minDist) return { x, y };
-    }
-    return {
-      x: DISTRACTOR_SLOTS[0][0] * window.innerWidth,
-      y: DISTRACTOR_SLOTS[0][1] * window.innerHeight,
-    };
+    // tiny windows: drop the move-away rule first, then settle for the
+    // corner farthest from the wheel that isn't under the tray
+    if (fallback) return fallback;
+    const corners = [[minX, minY], [maxX, minY], [minX, maxY], [maxX, maxY]]
+      .filter(([x, y]) => !inTray(x, y))
+      .sort((a, b) => Math.hypot(b[0] - cx, b[1] - cy) - Math.hypot(a[0] - cx, a[1] - cy));
+    const [x, y] = corners.length ? corners[0] : [maxX, maxY];
+    return { x, y };
   };
 
   const showDistractor = () => {
     if (!active || !isSpinning || isLanding) return;
     const kind = DISTRACTOR_KINDS[Math.floor(Math.random() * DISTRACTOR_KINDS.length)];
-    const slot = pickDistractorSlot();
     const size = Math.round(rand(22, 30));
+    const slot = pickDistractorSlot(size);
+    lastDistractorSpot = slot;
     distractorEl.className = "spin-distractor spin-distractor-" + kind;
     distractorEl.style.width = size + "px";
     distractorEl.style.height = size + "px";
@@ -466,8 +812,8 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
       x: Math.round(slot.x),
       y: Math.round(slot.y),
       size,
-      shown_at: Math.round(performance.now() - spinnerStartTs),
-      hidden_at: null,
+      t_on: toTrialClock(performance.now()),
+      t_off: null,
       n_spins: spinnerData.outcomes.length,
     };
     spinnerData.distractors.push(currentDistractor);
@@ -605,6 +951,7 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
       const img = faceSrc ? faceImages[faceSrc] : null;
       const faceRadius = faceOffsetY * (drawRadius / rad);
       if (img && img.complete) {
+        ctx.drawImage(img, -faceSize / 2, faceRadius - faceSize / 2, faceSize, faceSize);
         if (isSpinning && i === highlightIndex) {
           ctx.beginPath();
           ctx.strokeStyle = "#000";
@@ -612,7 +959,6 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
           ctx.arc(0, faceRadius, faceSize / 2 + 4, 0, 2 * PI);
           ctx.stroke();
         }
-        ctx.drawImage(img, -faceSize / 2, faceRadius - faceSize / 2, faceSize, faceSize);
       }
       ctx.restore();
     }
@@ -651,10 +997,12 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     spinnerData.isSpinning = true;
     if (collectedFacesEl && faceSrc) {
       const img = document.createElement("img");
+      img.onload = measureGeometry; // a new tray row can push the wheel down
       img.src = faceSrc;
       img.alt = String(points);
       img.className = "collected-face";
       collectedFacesEl.appendChild(img);
+      measureGeometry();
     }
     setTimeout(() => {
       if (!active) return;
@@ -666,7 +1014,7 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
       drawSector(sectors, null);
       // still holding space after landing — resume pacing without a re-press
       if (spaceHeld) {
-        startSpin();
+        startSpin(true);
       }
     }, 1000);
   };
@@ -679,11 +1027,16 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     isDecelerating = false;
     isLanding = true;
     const sector = sectors[idx];
+    const holdMs = pendingHoldMs != null ? pendingHoldMs : null;
     spinnerData.outcomes.push(sector.value);
-    spinnerData.hold_durations.push(
-      pendingHoldMs != null ? pendingHoldMs : null
-    );
+    spinnerData.hold_durations.push(holdMs);
     pendingHoldMs = null;
+    if (currentSpin) {
+      currentSpin.t_land = toTrialClock(performance.now());
+      currentSpin.hold_ms = holdMs;
+      currentSpin.outcome = sector.value;
+      currentSpin = null;
+    }
     drawSector(sectors, idx);
     if (sector.value === 5) {
       if (stopConfetti) stopConfetti();
@@ -748,9 +1101,20 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     animFrame = window.requestAnimationFrame(giveMoment);
   };
 
-  const startSpin = () => {
+  // resumed: started because space was still held when the last landing ended
+  const startSpin = (resumed = false) => {
     if (!active || isSpinning || isLanding) return;
     if (spinnerData.maxSpins != null && spinnerData.outcomes.length >= spinnerData.maxSpins) return;
+    measureGeometry();
+    currentSpin = {
+      t_start: toTrialClock(performance.now()),
+      t_release: null,
+      t_land: null,
+      hold_ms: null,
+      outcome: null,
+      resumed: resumed ? 1 : 0,
+    };
+    spinnerData.spins.push(currentSpin);
     isSpinning = true;
     isAccelerating = true;
     isDecelerating = false;
@@ -814,6 +1178,7 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
         holdStartTs = null;
       }
       if (isSpinning && !isDecelerating && !isLanding) {
+        if (currentSpin) currentSpin.t_release = toTrialClock(keyupTs);
         beginStop();
       }
     }, 40);
@@ -824,6 +1189,7 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     wheelHeight = canvas.getBoundingClientRect()['height'];
     wheelX = canvas.getBoundingClientRect()['x'] + wheelWidth / 2;
     wheelY = canvas.getBoundingClientRect()['y'] + wheelHeight / 2;
+    measureGeometry();
   };
 
   spinnerData.isSpinning = false;
@@ -835,9 +1201,11 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
       clearTimeout(releaseTimer);
       releaseTimer = null;
     }
+    measureGeometry();
     window.removeEventListener("keydown", onKeyDown);
     window.removeEventListener("keyup", onKeyUp);
     window.removeEventListener("resize", onResize, true);
+    window.removeEventListener("scroll", measureGeometry, true);
     if (animFrame) window.cancelAnimationFrame(animFrame);
     if (stopConfetti) stopConfetti();
     stopDistractors(true);
@@ -855,5 +1223,6 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("keyup", onKeyUp);
   window.addEventListener("resize", onResize, true);
+  window.addEventListener("scroll", measureGeometry, { capture: true, passive: true });
 
 };

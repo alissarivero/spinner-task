@@ -140,6 +140,8 @@ var jsPsychCanvasButtonResponse = (function (jspsych) {
             outcomes: [],
             hold_durations: [],
             distractors: [],
+            spins: [],
+            layouts: [],
             score: trial.score || 0,
             rt: null,
             isSpinning: false,
@@ -164,9 +166,11 @@ var jsPsychCanvasButtonResponse = (function (jspsych) {
                   outcomes: spinnerData.outcomes,
                   hold_durations: spinnerData.hold_durations,
                   distractors: spinnerData.distractors,
+                  spins: spinnerData.spins,
                   score: spinnerData.score,
                   rt: spinnerData.rt,
                   n_spins: spinnerData.outcomes.length,
+                  layouts: spinnerData.layouts,
               };
               // clear the display
               display_element.innerHTML = "";

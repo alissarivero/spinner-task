@@ -131,12 +131,14 @@ const exp = (function() {
         stimulus: `
           <div class='parent'>
             <p>Now you'll calibrate the eye tracker so the software can use the image of your eyes to predict where you are looking.</p>
-            <p>You'll see a series of dots appear on the screen. Look at each dot and click on it.</p>
+            <p>Cute animals will pop up around the screen. Look right at each animal and click on it!</p>
           </div>
         `,
         choices: ["Got it"],
         data: { phase: "eyetracking_calibration_instructions" },
     };
+
+    let stopAnimalCalibration = null;
 
     p.calibration = {
         type: jsPsychWebgazerCalibrate,
@@ -148,13 +150,20 @@ const exp = (function() {
         repetitions_per_point: 1,
         randomize_calibration_order: true,
         data: { phase: "eyetracking_calibration" },
+        on_load: function() {
+            stopAnimalCalibration = startAnimalCalibration();
+        },
+        on_finish: function() {
+            if (stopAnimalCalibration) stopAnimalCalibration();
+            stopAnimalCalibration = null;
+        },
     };
 
     p.calibrationDone = {
         type: jsPsychHtmlButtonResponse,
         stimulus: `
           <div class='parent'>
-            <p>Great, we're done with calibration!</p>
+            <p>Great job finding all the animals! We're done with calibration.</p>
             <p>Please keep your head reasonably still for the rest of the study.</p>
           </div>
         `,
@@ -968,7 +977,6 @@ const exp = (function() {
             data.happiness_label = happinessLabels[data.response];
             let scoreArray = jsPsych.data.get().select('score').values;
             let outcomesArray = jsPsych.data.get().select('outcomes').values;
-            // use last spin score (flowMeasure temporarily not presented)
             data.score = scoreArray[scoreArray.length - 1];
             data.outcomes = outcomesArray[outcomesArray.length - 1];
             round++;
@@ -977,9 +985,8 @@ const exp = (function() {
     };
 
     // timeline: main task
-    // NOTE: flowMeasure (immersed/engaged) temporarily hidden — keep definition above to re-enable
     p.task = {
-        timeline: [spin, likingMeasure, /* flowMeasure, */ happinessMeasure],
+        timeline: [spin, likingMeasure, flowMeasure, happinessMeasure],
         repetitions: 1,
         timeline_variables: wheels,
         randomize_order: true,
@@ -1123,7 +1130,7 @@ const exp = (function() {
     *
     */
 
-    // CSV is downloaded locally in jsPsych on_finish (see utils.js) — no OSF/DataPipe upload
+    // CSV is uploaded once in jsPsych on_finish (see utils.js); nothing is saved on the participant's computer
 
     return p;
 
