@@ -2,27 +2,46 @@
 // independent WebGazer sessions — do not restore prior IndexedDB training
 window.saveDataAcrossSessions = false;
 
-// PLACEHOLDER: where session data is sent. Nothing is saved until this is set.
+// Session data goes to OSF through DataPipe (pipe.jspsych.org), which writes
+// each upload as a file in the OSF project linked to this experiment ID.
 // Data is never downloaded onto the participant's computer.
-const DATA_UPLOAD_URL = null;
+const DATAPIPE_EXPERIMENT_ID = "DM7NGSQ4xpi8";
+const DATAPIPE_URL = "https://pipe.jspsych.org/api/data/";
 
 const uploadSessionData = async (csv, name) => {
-    if (!DATA_UPLOAD_URL) {
-        throw new Error("No data upload destination is set (DATA_UPLOAD_URL in jsFiles/utils.js).");
-    }
-    const res = await fetch(DATA_UPLOAD_URL, {
+    const res = await fetch(DATAPIPE_URL, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: name, data: csv }),
+        headers: { "Content-Type": "application/json", Accept: "*/*" },
+        body: JSON.stringify({
+            experimentID: DATAPIPE_EXPERIMENT_ID,
+            filename: name,
+            data: csv,
+        }),
     });
-    if (!res.ok) throw new Error(`Upload failed with status ${res.status}`);
+    if (!res.ok) {
+        // DataPipe answers with { error, message } — surface the real reason
+        let detail = "";
+        try {
+            const body = await res.json();
+            detail = body.message || body.error || "";
+        } catch (_) { /* non-JSON error body */ }
+        throw new Error(`Upload failed with status ${res.status}${detail ? `: ${detail}` : ""}`);
+    }
+};
+
+// compact local timestamp for filenames: YYYYMMDD-HHMMSS
+const fileTimestamp = (d = new Date()) => {
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
+        `-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
 };
 
 /*
  * Session CSV: one event per row, identified by row_type.
  *   trial - one per screen (answers; wheel screens add score and needle/wheel geometry)
  *   spin  - one per rotation of a wheel
- *   shape - one per distractor shape shown during a wheel
+ *   shape - one per distractor shape shown during a wheel (shape_trigger = the
+ *           spin event that showed it; shape_cut_short = replaced before its time)
  *   gaze  - one per WebGazer sample on a wheel
  * Spin, shape, and gaze times are ms on that trial's webgazer_data clock.
  * Positions are viewport pixels, the same space as gaze_x / gaze_y. The page
@@ -42,6 +61,7 @@ const CSV_TRIAL_FIELDS = [
     // design
     "spinner_type", "round", "order", "bonus_round", "order_perm", "chosen_spinner",
     "high_outcome_order", "medium_outcome_order", "half51_outcome_order",
+    "distractor_seed", "distractor_schedule",
     // answers
     "rt", "response", "liking", "liking_label", "flow", "happiness", "happiness_label",
     "training_question", "left_face", "right_face", "chosen_face", "correct", "attempt", "confirmed",
@@ -54,7 +74,7 @@ const CSV_COLUMNS = ["row_type"].concat(
     CSV_TRIAL_FIELDS,
     ["spin_index", "t_start", "t_release", "t_land", "hold_ms", "outcome", "resumed"],
     ["shape_index", "shape", "shape_x", "shape_y", "shape_x_norm", "shape_y_norm", "shape_size",
-     "t_on", "t_off", "spins_landed"],
+     "t_on", "t_off", "spins_landed", "shape_trigger", "shape_jitter_ms", "shape_cut_short"],
     ["t", "gaze_x", "gaze_y", "gaze_x_norm", "gaze_y_norm", "dist_needle", "on_needle", "on_wheel",
      "spinning", "shape_visible", "ms_from_onset", "dist_shape"],
 );
@@ -125,6 +145,10 @@ const eventRows = (trial) => {
             t_on: d.t_on,
             t_off: d.t_off,
             spins_landed: d.n_spins,
+            spin_index: d.spin_index != null ? d.spin_index + 1 : null,
+            shape_trigger: d.trigger,
+            shape_jitter_ms: d.jitter_ms,
+            shape_cut_short: d.cut_short ? 1 : 0,
         });
         const layout = layoutAt(layouts, d.t_on);
         if (layout) {
@@ -243,8 +267,85 @@ let runMode = null;
 
 const setSubject = (id) => {
     subject_id = String(id).trim();
-    filename = `${subject_id}.csv`;
+    // timestamp keeps re-entered participant numbers (and every "test" run) from
+    // colliding — DataPipe rejects a filename that already exists in the project
+    filename = `${subject_id}_${fileTimestamp()}.csv`;
     jsPsych.data.addProperties({ subject: subject_id, run_mode: runMode });
+    getDistractorSchedule(); // fix the shape schedule before any wheel appears
+};
+
+/*
+ * Distractor schedule: shapes appear at fixed moments of a spin, not at random.
+ * Six trigger events, each used twice over spins 1-4 (3 per spin, no event
+ * repeated within a spin); spins 5+ replay that 4-spin block. One schedule per
+ * participant (seeded from the subject ID), shared by every wheel.
+ */
+const DISTRACTOR_EVENTS = [
+    "wedges_visible", // wheel drawn and idle, waiting for a press
+    "charge",         // space pressed — wheel starts pacing
+    "launch",         // space released — coast begins
+    "slowing",        // coast velocity has dropped to half the launch velocity
+    "almost_stopped", // less than ALMOST_STOPPED_DEG of rotation left
+    "land",           // outcome sector reached
+];
+const DISTRACTOR_BLOCK_SPINS = 4;
+const DISTRACTORS_PER_SPIN = 3;
+
+// FNV-1a 32-bit — stable seed from a subject ID string
+const hashString = (str) => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h >>> 0;
+};
+
+// same LCG shuffle as exp.js so both schedules are reproducible from a seed
+const shuffleSeeded = (arr, seed) => {
+    const a = arr.slice();
+    let s = seed >>> 0;
+    for (let i = a.length - 1; i > 0; i--) {
+        s = (s * 1664525 + 1013904223) >>> 0;
+        const j = s % (i + 1);
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+};
+
+const buildDistractorSchedule = (seed) => {
+    const pool = DISTRACTOR_EVENTS.concat(DISTRACTOR_EVENTS); // 12 = each event twice
+    for (let attempt = 0; attempt < 1000; attempt++) {
+        const order = shuffleSeeded(pool, (seed + attempt * 7919) >>> 0);
+        const blocks = [];
+        for (let i = 0; i < DISTRACTOR_BLOCK_SPINS; i++) {
+            blocks.push(order.slice(i * DISTRACTORS_PER_SPIN, (i + 1) * DISTRACTORS_PER_SPIN));
+        }
+        const noRepeats = blocks.every((b) => new Set(b).size === b.length);
+        if (noRepeats) return blocks;
+    }
+    // unreachable in practice; fall back to a fixed valid layout
+    return [
+        ["wedges_visible", "launch", "almost_stopped"],
+        ["charge", "slowing", "land"],
+        ["wedges_visible", "slowing", "land"],
+        ["charge", "launch", "almost_stopped"],
+    ];
+};
+
+let distractorSchedule = null;
+let distractorSeed = null;
+const getDistractorSchedule = () => {
+    if (distractorSchedule) return distractorSchedule;
+    distractorSeed = subject_id
+        ? hashString(subject_id)
+        : Math.floor(Math.random() * 0x100000000);
+    distractorSchedule = buildDistractorSchedule(distractorSeed);
+    jsPsych.data.addProperties({
+        distractor_seed: distractorSeed,
+        distractor_schedule: distractorSchedule.map((b) => b.join("+")).join("|"),
+    });
+    return distractorSchedule;
 };
 
 // Space mutes Zoom if this tab is not focused. Cover the page until they click back.
@@ -726,7 +827,17 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
   };
   measureGeometry();
 
-  /* faint peripheral shapes during spins (low-contrast, one at a time) */
+  /* faint peripheral shapes (low-contrast, one at a time), each tied to a spin event */
+  const SLOWING_VEL_FRAC = 0.5;     // "slowing" fires when coast velocity <= this x launch velocity
+  const ALMOST_STOPPED_DEG = 90;    // "almost_stopped" fires with <= this much rotation left (one sector)
+  const DISTRACTOR_JITTER_MS = 100; // shape appears 0..this ms after its trigger
+  const DISTRACTOR_VISIBLE_MS = [900, 1600];
+  const distractorSchedule = getDistractorSchedule();
+  let spinIndex = spinnerData.outcomes.length; // spin the current events belong to (0-based)
+  let firedThisSpin = new Set();
+  let launchVel = null; // coast velocity at release, for the "slowing" threshold
+  const pendingShowTimers = new Set(); // jitter timers not yet fired
+  let hideTimer = null;
   const DISTRACTOR_KINDS = ["circle", "square", "triangle", "diamond"];
   const DISTRACTOR_EDGE = 30;      // px kept clear of the viewport edge
   const DISTRACTOR_WHEEL_GAP = 50; // px kept clear outside the wheel rim
@@ -743,12 +854,17 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
   const distractorEl = document.createElement("div");
   distractorEl.className = "spin-distractor";
   distractorLayer.appendChild(distractorEl);
-  let distractorTimer = null;
   let currentDistractor = null;
 
+  // immediate: hidden before its planned duration (replaced by a newer trigger, or trial ended)
   const hideDistractor = (immediate) => {
+    if (hideTimer != null) {
+      clearTimeout(hideTimer);
+      hideTimer = null;
+    }
     if (currentDistractor && currentDistractor.t_off == null) {
       currentDistractor.t_off = toTrialClock(performance.now());
+      currentDistractor.cut_short = !!immediate;
     }
     currentDistractor = null;
     distractorEl.classList.remove("is-visible");
@@ -793,8 +909,10 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     return { x, y };
   };
 
-  const showDistractor = () => {
-    if (!active || !isSpinning || isLanding) return;
+  // a newer trigger replaces whatever shape is still showing
+  const showDistractor = (trigger, jitterMs) => {
+    if (!active) return;
+    if (currentDistractor) hideDistractor(true);
     const kind = DISTRACTOR_KINDS[Math.floor(Math.random() * DISTRACTOR_KINDS.length)];
     const size = Math.round(rand(22, 30));
     const slot = pickDistractorSlot(size);
@@ -815,30 +933,45 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
       t_on: toTrialClock(performance.now()),
       t_off: null,
       n_spins: spinnerData.outcomes.length,
+      spin_index: spinIndex,
+      trigger,
+      jitter_ms: jitterMs,
+      cut_short: false,
     };
     spinnerData.distractors.push(currentDistractor);
+    hideTimer = setTimeout(() => {
+      hideTimer = null;
+      hideDistractor(false);
+    }, rand(DISTRACTOR_VISIBLE_MS[0], DISTRACTOR_VISIBLE_MS[1]));
+  };
+
+  // the spin whose events we are now inside; resets the per-spin fired set
+  const beginSpinPhase = () => {
+    const next = spinnerData.outcomes.length;
+    if (next !== spinIndex) {
+      spinIndex = next;
+      firedThisSpin = new Set();
+    }
+  };
+
+  // show a shape (after jitter) if this event is on the schedule for this spin
+  const fireTrigger = (eventName) => {
+    if (!active || firedThisSpin.has(eventName)) return;
+    firedThisSpin.add(eventName);
+    const block = distractorSchedule[spinIndex % DISTRACTOR_BLOCK_SPINS];
+    if (!block || block.indexOf(eventName) === -1) return;
+    const jitter = Math.round(rand(0, DISTRACTOR_JITTER_MS));
+    const timer = setTimeout(() => {
+      pendingShowTimers.delete(timer);
+      showDistractor(eventName, jitter);
+    }, jitter);
+    pendingShowTimers.add(timer);
   };
 
   const stopDistractors = (immediate) => {
-    if (distractorTimer != null) {
-      clearTimeout(distractorTimer);
-      distractorTimer = null;
-    }
+    pendingShowTimers.forEach((t) => clearTimeout(t));
+    pendingShowTimers.clear();
     hideDistractor(immediate);
-  };
-
-  const scheduleNextDistractor = () => {
-    if (!active || !isSpinning || isLanding) return;
-    distractorTimer = setTimeout(() => {
-      distractorTimer = null;
-      showDistractor();
-      const visibleFor = rand(900, 1600);
-      distractorTimer = setTimeout(() => {
-        distractorTimer = null;
-        hideDistractor(false);
-        scheduleNextDistractor();
-      }, visibleFor);
-    }, rand(800, 2000));
   };
 
   /* state variables */
@@ -1012,6 +1145,11 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
       isAccelerating = false;
       spinnerData.isSpinning = false;
       drawSector(sectors, null);
+      // wheel idle again: the next spin's "wedges_visible" moment (unless the wheel is done)
+      if (spinnerData.maxSpins == null || spinnerData.outcomes.length < spinnerData.maxSpins) {
+        beginSpinPhase();
+        fireTrigger("wedges_visible");
+      }
       // still holding space after landing — resume pacing without a re-press
       if (spaceHeld) {
         startSpin(true);
@@ -1045,7 +1183,7 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     if (sector.value === 1 || sector.value === 2 || sector.value === 4 || sector.value === 5) {
       playFaceSound(sector.value);
     }
-    stopDistractors(false);
+    fireTrigger("land");
     updateScore(sector.value, sector.color, sector.face);
     if (forcedValueQueue && forcedValueQueue.length > 0) {
       forcedValueQueue.shift();
@@ -1087,6 +1225,14 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     angVel = step.nextVel;
     render(oldAngle);
 
+    // coast milestones (fireTrigger ignores repeats within a spin)
+    if (launchVel != null && angVel <= launchVel * SLOWING_VEL_FRAC) {
+      fireTrigger("slowing");
+    }
+    if (angVel / FRICTION_K <= ALMOST_STOPPED_DEG) { // remaining rotation = v / k
+      fireTrigger("almost_stopped");
+    }
+
     if (Math.abs(angVel) < STOP_THRESHOLD) {
       angVel = 0;
       currentAngle = oldAngle;
@@ -1127,8 +1273,9 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     spinnerData.isSpinning = true;
     lastTs = null;
     angVel = PACE_VEL;
-    stopDistractors(true);
-    scheduleNextDistractor();
+    launchVel = null;
+    beginSpinPhase();
+    fireTrigger("charge");
     animFrame = window.requestAnimationFrame(giveMoment);
   };
 
@@ -1142,6 +1289,8 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
     } else {
       angVel = LAUNCH_VEL;
     }
+    launchVel = angVel;
+    fireTrigger("launch");
   };
 
   const onKeyDown = (e) => {
@@ -1218,6 +1367,9 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
   preloadFaceImages(sectors).then(() => {
     if (!active) return;
     drawSector(sectors, null);
+    // first sight of the wedges — spin 1's "wedges_visible" moment
+    beginSpinPhase();
+    fireTrigger("wedges_visible");
   });
 
   window.addEventListener("keydown", onKeyDown);

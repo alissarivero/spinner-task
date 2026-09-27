@@ -1130,7 +1130,8 @@ const exp = (function() {
     *
     */
 
-    // CSV is uploaded once in jsPsych on_finish (see utils.js); nothing is saved on the participant's computer
+    // CSV is uploaded once in jsPsych on_finish (see utils.js) to OSF via DataPipe;
+    // nothing is saved on the participant's computer
 
     return p;
 
