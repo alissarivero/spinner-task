@@ -1308,6 +1308,11 @@
   border-color: #bbb;
 }
 
+/* experimenter shortcut; only revealed with ?test=1 in the URL */
+.home-entry-test[hidden] {
+  display: none;
+}
+
 #study-focus-overlay {
   display: none;
   position: fixed;

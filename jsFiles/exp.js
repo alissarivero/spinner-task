@@ -74,6 +74,11 @@ const exp = (function() {
             const testBtn = document.getElementById("home-test");
             if (!input || !startBtn || !testBtn) return;
 
+            // the shortcut skips consent, camera setup, and training — only show
+            // it to experimenters who open the page with ?test=1
+            const showTest = new URLSearchParams(window.location.search).get("test") === "1";
+            testBtn.hidden = !showTest;
+
             const finish = (mode, id) => {
                 runMode = mode;
                 setSubject(id);
