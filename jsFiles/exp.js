@@ -23,13 +23,6 @@ const exp = (function() {
                 <p>After each wheel, you'll say how much you liked it and how happy you feel.</p>
             </div>`,
         ],
-
-        postTask: [
-            `<div class='parent'>
-                <p><strong>Thanks for playing!</strong></p>
-                <p>Just a few last questions.</p>
-            </div>`
-        ],
     };
 
     p.consent = {
@@ -108,6 +101,36 @@ const exp = (function() {
             });
 
             input.focus();
+        },
+    };
+
+    p.soundCheck = {
+        type: jsPsychHtmlKeyboardResponse,
+        stimulus: `
+          <div class="parent">
+            <p><strong>Check your sound</strong></p>
+            <p>Turn your sound on, then play the test sound. You should hear a short tune.</p>
+            <p>
+              <button type="button" id="sound-check-play" class="jspsych-btn">Play sound</button>
+              <button type="button" id="sound-check-replay" class="jspsych-btn">Replay</button>
+            </p>
+            <p><button type="button" id="sound-check-continue" class="jspsych-btn">I can hear it</button></p>
+          </div>
+        `,
+        choices: "NO_KEYS",
+        response_ends_trial: false,
+        data: { phase: "sound_check" },
+        on_load: function() {
+            const playBtn = document.getElementById("sound-check-play");
+            const replayBtn = document.getElementById("sound-check-replay");
+            const continueBtn = document.getElementById("sound-check-continue");
+            if (playBtn) playBtn.addEventListener("click", () => playFaceSound(5));
+            if (replayBtn) replayBtn.addEventListener("click", () => playFaceSound(5));
+            if (continueBtn) {
+                continueBtn.addEventListener("click", () => {
+                    jsPsych.finishTrial({ phase: "sound_check" });
+                });
+            }
         },
     };
 
@@ -1063,74 +1086,6 @@ const exp = (function() {
 
    /*
     *
-    *   Demographics
-    *
-    */
-
-    p.demographics = (function() {
-
-
-        const taskComplete = {
-            type: jsPsychInstructions,
-            pages: html.postTask,
-            show_clickable_nav: true,
-            post_trial_gap: 500,
-        };
-
-        const gender = {
-            type: jsPsychHtmlButtonResponse,
-            stimulus: '<p>What is your gender?</p>',
-            choices: ['Male', 'Female', 'Other'],
-            on_finish: (data) => {
-                data.gender = data.response;
-            }
-        };
-
-        const age = {
-            type: jsPsychSurveyText,
-            questions: [{prompt: "Age:", name: "age"}],
-            on_finish: (data) => {
-                saveSurveyData(data); 
-            },
-        }; 
-
-        const ethnicity = {
-            type: jsPsychHtmlButtonResponse,
-            stimulus: '<p>What is your race?</p>',
-            choices: ['White / Caucasian', 'Black / African American','Asian / Pacific Islander', 'Hispanic', 'Native American', 'Other'],
-            on_finish: (data) => {
-                data.ethnicity = data.response;
-            }
-        };
-
-        const english = {
-            type: jsPsychHtmlButtonResponse,
-            stimulus: '<p>Is English your native language?:</p>',
-            choices: ['Yes', 'No'],
-            on_finish: (data) => {
-                data.english = data.response;
-            }
-        };  
-
-        const finalWord = {
-            type: jsPsychSurveyText,
-            questions: [{prompt: "Questions? Comments? Complains? Provide your feedback here!", rows: 10, columns: 100, name: "finalWord"}],
-            on_finish: (data) => {
-                saveSurveyData(data); 
-            },
-        }; 
-
-        const demos = {
-            timeline: [taskComplete, gender, age, ethnicity, english, finalWord]
-        };
-
-        return demos;
-
-    }());
-
-
-   /*
-    *
     *   SAVE DATA
     *
     */
@@ -1173,7 +1128,7 @@ const attachGaze = (node) => {
     return next;
 };
 
-const fullPath = [];
+const fullPath = [exp.soundCheck];
 if (!SKIP_CONSENT) fullPath.push(exp.consent);
 fullPath.push(
     exp.cameraInstructions,
@@ -1198,7 +1153,6 @@ fullPath.push(
         exp.bonusChoice,
         exp.bonusSpin,
         exp.outroVideo,
-        exp.demographics,
     ])
 );
 

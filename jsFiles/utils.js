@@ -843,7 +843,6 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
   let launchVel = null; // coast velocity at release, for the "slowing" threshold
   const pendingShowTimers = new Set(); // jitter timers not yet fired
   let hideTimer = null;
-  const DISTRACTOR_KINDS = ["circle", "square", "triangle", "diamond"];
   const DISTRACTOR_EDGE = 30;      // px kept clear of the viewport edge
   const DISTRACTOR_WHEEL_GAP = 50; // px kept clear outside the wheel rim
   const DISTRACTOR_TRAY_GAP = 30;  // px kept clear around the collected-faces tray
@@ -918,7 +917,7 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
   const showDistractor = (trigger, jitterMs) => {
     if (!active) return;
     if (currentDistractor) hideDistractor(true);
-    const kind = DISTRACTOR_KINDS[Math.floor(Math.random() * DISTRACTOR_KINDS.length)];
+    const kind = "circle";
     const size = Math.round(rand(22, 30));
     const slot = pickDistractorSlot(size);
     lastDistractorSpot = slot;
