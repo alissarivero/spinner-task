@@ -72,7 +72,8 @@ const CSV_TRIAL_FIELDS = [
 ].concat(LAYOUT_FIELDS);
 const CSV_COLUMNS = ["row_type"].concat(
     CSV_TRIAL_FIELDS,
-    ["spin_index", "t_start", "t_release", "t_land", "hold_ms", "outcome", "resumed"],
+    ["spin_index", "t_start", "t_release", "t_land", "hold_ms", "outcome",
+     "edge_dist_deg", "wedge_pos", "near_edge", "neighbor_outcome", "resumed"],
     ["shape_index", "shape", "shape_x", "shape_y", "shape_x_norm", "shape_y_norm", "shape_size",
      "t_on", "t_off", "spins_landed", "shape_trigger", "shape_jitter_ms", "shape_cut_short"],
     ["t", "gaze_x", "gaze_y", "gaze_x_norm", "gaze_y_norm", "dist_needle", "on_needle", "on_wheel",
@@ -121,6 +122,10 @@ const eventRows = (trial) => {
             t_land: s.t_land,
             hold_ms: s.hold_ms,
             outcome: s.outcome,
+            edge_dist_deg: s.edge_dist_deg,
+            wedge_pos: s.wedge_pos,
+            near_edge: s.near_edge,
+            neighbor_outcome: s.neighbor_outcome,
             resumed: s.resumed,
         });
         const layout = layoutAt(layouts, s.t_start);
@@ -1159,6 +1164,24 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
 
   let stopConfetti = null;
 
+  // Where the needle stopped inside wedge idx. The wheel turns clockwise, so the
+  // needle crosses each wedge from its high edge ((idx+1) * width) toward its low
+  // edge (idx * width) and would next enter wedge idx-1.
+  const landingEdge = (idx, angle) => {
+    const wedgeDeg = 360 / tot;
+    const onWheel = ((POINTER_DEG - angle) % 360 + 360) % 360;
+    let fromLow = ((onWheel - idx * wedgeDeg) % 360 + 360) % 360;
+    if (fromLow > 180) fromLow -= 360; // stop threshold can leave it a hair past the edge
+    const pos = 1 - fromLow / wedgeDeg;
+    const nearExit = pos >= 0.5;
+    return {
+      edge_dist_deg: Math.round((nearExit ? fromLow : wedgeDeg - fromLow) * 100) / 100,
+      wedge_pos: Math.round(pos * 1000) / 1000,
+      near_edge: nearExit ? "exit" : "entry",
+      neighbor_outcome: sectors[((idx + (nearExit ? -1 : 1)) % tot + tot) % tot].value,
+    };
+  };
+
   const landOnSector = (idx) => {
     animFrame = null;
     angVel = 0;
@@ -1173,6 +1196,7 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
       currentSpin.t_land = toTrialClock(performance.now());
       currentSpin.hold_ms = holdMs;
       currentSpin.outcome = sector.value;
+      Object.assign(currentSpin, landingEdge(idx, currentAngle));
       currentSpin = null;
     }
     drawSector(sectors, idx);
@@ -1258,6 +1282,10 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
       t_land: null,
       hold_ms: null,
       outcome: null,
+      edge_dist_deg: null,
+      wedge_pos: null,
+      near_edge: null,
+      neighbor_outcome: null,
       resumed: resumed ? 1 : 0,
     };
     spinnerData.spins.push(currentSpin);
