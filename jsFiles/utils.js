@@ -55,7 +55,7 @@ const LAYOUT_FIELDS = [
 ];
 const CSV_TRIAL_FIELDS = [
     // identity
-    "subject", "run_mode", "trial_index", "trial_type", "phase", "time_elapsed", "internal_node_id",
+    "subject", "run_mode", "session_code", "trial_index", "trial_type", "phase", "time_elapsed", "internal_node_id",
     // device and browser
     "screen_w", "screen_h", "device_pixel_ratio", "user_agent",
     // design

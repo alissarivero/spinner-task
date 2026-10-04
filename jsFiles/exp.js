@@ -137,9 +137,51 @@ const exp = (function() {
             <p>If you are on Zoom, turn <strong>off your Zoom camera</strong> first.</p>
             <p>On the next screen, please allow camera access when the browser asks.</p>
           </div>
+          <div class="eye-bypass">
+            <button type="button" id="eye-bypass-open" class="jspsych-btn eye-bypass-open">Bypass eye-tracking</button>
+            <div id="eye-bypass-panel" class="eye-bypass-panel" hidden>
+              <input id="eye-bypass-password" type="password" autocomplete="off" placeholder="Password" />
+              <button type="button" id="eye-bypass-submit" class="jspsych-btn">Continue</button>
+              <p id="eye-bypass-error" class="eye-bypass-error" hidden>Incorrect password.</p>
+            </div>
+          </div>
         `,
         choices: ["Got it"],
         data: { phase: "eyetracking_camera_instructions" },
+        on_load: function() {
+            const openBtn = document.getElementById("eye-bypass-open");
+            const panel = document.getElementById("eye-bypass-panel");
+            const input = document.getElementById("eye-bypass-password");
+            const submit = document.getElementById("eye-bypass-submit");
+            const error = document.getElementById("eye-bypass-error");
+            const tryBypass = () => {
+                if ((input && input.value || "").trim() === "809809") {
+                    skipEyeTracking = true;
+                    jsPsych.finishTrial({
+                        phase: "eyetracking_camera_instructions",
+                        eye_tracking: "bypassed",
+                    });
+                } else if (error) {
+                    error.hidden = false;
+                }
+            };
+            if (openBtn && panel) {
+                openBtn.addEventListener("click", () => {
+                    panel.hidden = false;
+                    openBtn.hidden = true;
+                    if (input) input.focus();
+                });
+            }
+            if (submit) submit.addEventListener("click", tryBypass);
+            if (input) {
+                input.addEventListener("keydown", (e) => {
+                    if (e.key === "Enter") {
+                        e.preventDefault();
+                        tryBypass();
+                    }
+                });
+            }
+        },
     };
 
     p.initCamera = {
@@ -204,6 +246,48 @@ const exp = (function() {
                 jsPsych.extensions.webgazer.hidePredictions();
                 jsPsych.extensions.webgazer.startMouseCalibration();
             }
+        },
+    };
+
+    p.sessionCode = {
+        type: jsPsychHtmlKeyboardResponse,
+        stimulus: `
+          <div class="parent">
+            <p><strong>Session code</strong></p>
+            <label class="home-entry-label" for="session-code">Enter the session code</label>
+            <input id="session-code" class="home-entry-input" type="text" autocomplete="off" />
+            <p id="session-code-error" class="home-entry-error" hidden>Please enter a session code.</p>
+            <div class="home-entry-actions">
+              <button type="button" id="session-code-continue" class="jspsych-btn">Continue</button>
+            </div>
+          </div>
+        `,
+        choices: "NO_KEYS",
+        response_ends_trial: false,
+        data: { phase: "session_code" },
+        on_load: function() {
+            const input = document.getElementById("session-code");
+            const err = document.getElementById("session-code-error");
+            const btn = document.getElementById("session-code-continue");
+            if (!input || !btn) return;
+            const finish = () => {
+                const code = (input.value || "").trim();
+                if (!code) {
+                    if (err) err.hidden = false;
+                    input.focus();
+                    return;
+                }
+                jsPsych.data.addProperties({ session_code: code });
+                jsPsych.finishTrial({ phase: "session_code", session_code: code });
+            };
+            btn.addEventListener("click", finish);
+            input.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") {
+                    e.preventDefault();
+                    finish();
+                }
+            });
+            input.focus();
         },
     };
 
@@ -1098,6 +1182,7 @@ const exp = (function() {
 }());
 
 const SKIP_CONSENT = false;
+let skipEyeTracking = false;
 
 const gazeTargetsFor = (trial) => {
     if (trial.type === jsPsychCanvasButtonResponse) {
@@ -1119,11 +1204,18 @@ const attachGaze = (node) => {
     const next = Object.assign({}, node);
     if (next.timeline) next.timeline = attachGaze(next.timeline);
     if (next.type) {
-        const existing = next.extensions || [];
-        next.extensions = existing.concat([{
-            type: jsPsychExtensionWebgazer,
-            params: { targets: gazeTargetsFor(next) },
-        }]);
+        const targets = gazeTargetsFor(next);
+        const userOnStart = next.on_start;
+        next.on_start = function(trial) {
+            if (!skipEyeTracking) {
+                const existing = trial.extensions || [];
+                trial.extensions = existing.concat([{
+                    type: jsPsychExtensionWebgazer,
+                    params: { targets },
+                }]);
+            }
+            if (typeof userOnStart === "function") userOnStart(trial);
+        };
     }
     return next;
 };
@@ -1132,11 +1224,17 @@ const fullPath = [exp.soundCheck];
 if (!SKIP_CONSENT) fullPath.push(exp.consent);
 fullPath.push(
     exp.cameraInstructions,
-    exp.initCamera,
-    exp.calibrationInstructions,
-    exp.calibration,
-    exp.calibrationDone,
+    {
+        timeline: [
+            exp.initCamera,
+            exp.calibrationInstructions,
+            exp.calibration,
+            exp.calibrationDone,
+        ],
+        conditional_function: () => !skipEyeTracking,
+    },
     ...attachGaze([
+        exp.sessionCode,
         exp.introVideo,
         exp.happinessTraining,
         exp.thumbsTraining,
