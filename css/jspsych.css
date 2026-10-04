@@ -1313,6 +1313,40 @@
   display: none;
 }
 
+#sound-check-play {
+  background-color: #ec407a;
+  border-color: #d81b60;
+  color: #fff;
+}
+
+#sound-check-continue {
+  background-color: #43a047;
+  border-color: #2e7d32;
+  color: #fff;
+}
+
+@media (hover: hover) {
+  #sound-check-play:hover {
+    background-color: #d81b60;
+    border-color: #ad1457;
+  }
+
+  #sound-check-continue:hover {
+    background-color: #2e7d32;
+    border-color: #1b5e20;
+  }
+}
+
+#sound-check-play:active {
+  background-color: #c2185b;
+  border-color: #880e4f;
+}
+
+#sound-check-continue:active {
+  background-color: #1b5e20;
+  border-color: #0d3b12;
+}
+
 #study-focus-overlay {
   display: none;
   position: fixed;

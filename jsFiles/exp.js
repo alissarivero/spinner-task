@@ -110,10 +110,7 @@ const exp = (function() {
           <div class="parent">
             <p><strong>Check your sound</strong></p>
             <p>Turn your sound on, then play the test sound. You should hear a short tune.</p>
-            <p>
-              <button type="button" id="sound-check-play" class="jspsych-btn">Play sound</button>
-              <button type="button" id="sound-check-replay" class="jspsych-btn">Replay</button>
-            </p>
+            <p><button type="button" id="sound-check-play" class="jspsych-btn">Play sound</button></p>
             <p><button type="button" id="sound-check-continue" class="jspsych-btn">I can hear it</button></p>
           </div>
         `,
@@ -122,10 +119,8 @@ const exp = (function() {
         data: { phase: "sound_check" },
         on_load: function() {
             const playBtn = document.getElementById("sound-check-play");
-            const replayBtn = document.getElementById("sound-check-replay");
             const continueBtn = document.getElementById("sound-check-continue");
             if (playBtn) playBtn.addEventListener("click", () => playFaceSound(5));
-            if (replayBtn) replayBtn.addEventListener("click", () => playFaceSound(5));
             if (continueBtn) {
                 continueBtn.addEventListener("click", () => {
                     jsPsych.finishTrial({ phase: "sound_check" });
@@ -139,10 +134,8 @@ const exp = (function() {
         stimulus: `
           <div class='parent'>
             <p>This study uses your webcam to track where you look on the screen.</p>
-            <p>If you are on Zoom, turn <strong>off your Zoom camera</strong> first. Zoom and this page cannot use the camera at the same time.</p>
+            <p>If you are on Zoom, turn <strong>off your Zoom camera</strong> first.</p>
             <p>On the next screen, please allow camera access when the browser asks.</p>
-            <p>If you do not wish to allow use of your camera, you cannot participate.</p>
-            <p>It may take up to 30 seconds for the camera to initialize after you give permission.</p>
           </div>
         `,
         choices: ["Got it"],
@@ -151,6 +144,13 @@ const exp = (function() {
 
     p.initCamera = {
         type: jsPsychWebgazerInitCamera,
+        instructions: `
+            <p>Wait up to 30 seconds for your video to appear on the page.</p>
+            <p>Position your head so that the webcam has a good view of your eyes.</p>
+            <p>Center your face in the box and look directly towards the camera.</p>
+            <p>It is important that you try and keep your head reasonably still throughout the experiment, so please take a moment to adjust your setup to be comfortable.</p>
+            <p>When your face is centered in the box and the box is green, you can click to continue.</p>
+        `,
         data: { phase: "eyetracking_init_camera" },
     };
 
