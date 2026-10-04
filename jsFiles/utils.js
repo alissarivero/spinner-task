@@ -960,7 +960,7 @@ const createSpinner = function(canvas, spinnerData, score, sectors, spinnerType,
 
   // show a shape (after jitter) if this event is on the schedule for this spin
   const fireTrigger = (eventName) => {
-    if (!active || firedThisSpin.has(eventName)) return;
+    if (spinnerType === "practice" || !active || firedThisSpin.has(eventName)) return;
     firedThisSpin.add(eventName);
     const block = distractorSchedule[spinIndex % DISTRACTOR_BLOCK_SPINS];
     if (!block || block.indexOf(eventName) === -1) return;

@@ -1066,12 +1066,11 @@
 
 .happiness-face-icon {
   display: block;
-  width: 72px;
-  height: 72px;
-  background-image: url("../img/happy_rating_bw.png");
+  width: 74px;
+  height: 80px;
+  background-image: url("../img/star likert scale.png");
   background-repeat: no-repeat;
   background-size: 500% 100%;
-  border-radius: 50%;
 }
 
 .happiness-face-0 { background-position: 0% 0; }
@@ -1439,7 +1438,7 @@ body.webgazer-hidden #webgazerGazeDot {
 }
 
 .spin-distractor.is-visible {
-  opacity: 0.42;
+  opacity: 0.22;
 }
 
 .spin-distractor-circle {
