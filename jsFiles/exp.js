@@ -110,6 +110,7 @@ const exp = (function() {
           <div class="parent">
             <p><strong>Check your sound</strong></p>
             <p>Turn your sound on, then play the test sound. You should hear a short tune.</p>
+            <p>Please keep your sound on for the rest of the study.</p>
             <p><button type="button" id="sound-check-play" class="jspsych-btn">Play sound</button></p>
             <p><button type="button" id="sound-check-continue" class="jspsych-btn">I can hear it</button></p>
           </div>
