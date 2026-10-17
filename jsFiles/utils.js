@@ -2,28 +2,46 @@
 // independent WebGazer sessions — do not restore prior IndexedDB training
 window.saveDataAcrossSessions = false;
 
-// Session data goes to OSF through DataPipe (pipe.jspsych.org), which writes
-// each upload as a file in the OSF project linked to this experiment ID.
+// Session data goes to Zenodo through DataPipe (pipe.jspsych.org), which writes
+// each upload as a file in the Zenodo deposition linked to this experiment ID.
 // Data is never downloaded onto the participant's computer.
 const DATAPIPE_EXPERIMENT_ID = "DM7NGSQ4xpi8";
 const DATAPIPE_URL = "https://pipe.jspsych.org/api/data/";
 
+// Gzip the JSON body when the browser supports it (DataPipe 32 MB / 60 s caps).
+const gzipText = async (text) => {
+    const stream = new Blob([text]).stream().pipeThrough(new CompressionStream("gzip"));
+    return await new Response(stream).blob();
+};
+
 const uploadSessionData = async (csv, name) => {
-    const res = await fetch(DATAPIPE_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "*/*" },
-        body: JSON.stringify({
-            experimentID: DATAPIPE_EXPERIMENT_ID,
-            filename: name,
-            data: csv,
-        }),
+    const payload = JSON.stringify({
+        experimentID: DATAPIPE_EXPERIMENT_ID,
+        filename: name,
+        data: csv,
     });
+    const headers = { "Content-Type": "application/json", Accept: "*/*" };
+    let body = payload;
+    if (typeof CompressionStream === "function") {
+        try {
+            body = await gzipText(payload);
+            headers["Content-Encoding"] = "gzip";
+        } catch (_) {
+            body = payload;
+        }
+    } else {
+        console.warn("CompressionStream not supported; sending DataPipe upload uncompressed.");
+    }
+    const res = await fetch(DATAPIPE_URL, { method: "POST", headers, body });
     if (!res.ok) {
-        // DataPipe answers with { error, message } — surface the real reason
+        // DataPipe answers with { error, message } — include the code so the
+        // on-screen save failure tells the experimenter why (token expired, etc.)
         let detail = "";
         try {
-            const body = await res.json();
-            detail = body.message || body.error || "";
+            const errBody = await res.json();
+            const code = errBody.error || "";
+            const message = errBody.message || "";
+            detail = code && message && code !== message ? `${code}: ${message}` : (message || code);
         } catch (_) { /* non-JSON error body */ }
         throw new Error(`Upload failed with status ${res.status}${detail ? `: ${detail}` : ""}`);
     }
@@ -43,7 +61,9 @@ const fileTimestamp = (d = new Date()) => {
  *   shape - one per distractor shape shown during a wheel (shape_trigger = the
  *           spin event that showed it; shape_cut_short = replaced before its time)
  *   gaze  - one per WebGazer sample on a wheel
+ *   iris  - one per Face Landmarker sample (blink, iris size, pupil/iris)
  * Spin, shape, and gaze times are ms on that trial's webgazer_data clock.
+ * Iris times use the same trial-relative clock (performance.now() origin).
  * Positions are viewport pixels, the same space as gaze_x / gaze_y. The page
  * layout is logged whenever it changes (resize, zoom, scroll, tray growth), and
  * each spin and gaze sample uses the layout on screen at that moment. *_norm
@@ -69,6 +89,15 @@ const CSV_TRIAL_FIELDS = [
     "gender", "age", "ethnicity", "english", "finalWord",
     // wheel screen (layout at the start of the wheel)
     "score", "n_spins",
+    // "bypassed" on the camera screen when the experimenter skipped eye tracking
+    "eye_tracking",
+    // eye-tracking accuracy check (validation trials; offsets in viewport px)
+    "validation_points", "roi_radius", "percent_in_roi", "average_offset", "samples_per_sec",
+    "val_n_samples", "val_median_offset_px", "val_mean_offset_px", "val_pct_in_roi",
+    "val_point_median_px",
+    // display and sampler timing (gaze-tracked trials)
+    "raf_fps", "long_frames", "max_frame_ms", "wg_n", "wg_hz", "wg_max_gap_ms",
+    "iris_n", "iris_hz", "iris_face_ok", "cam_fps", "cam_w", "cam_h",
 ].concat(LAYOUT_FIELDS);
 const CSV_COLUMNS = ["row_type"].concat(
     CSV_TRIAL_FIELDS,
@@ -78,7 +107,124 @@ const CSV_COLUMNS = ["row_type"].concat(
      "t_on", "t_off", "spins_landed", "shape_trigger", "shape_jitter_ms", "shape_cut_short"],
     ["t", "gaze_x", "gaze_y", "gaze_x_norm", "gaze_y_norm", "dist_needle", "on_needle", "on_wheel",
      "spinning", "shape_visible", "ms_from_onset", "dist_shape"],
+    ["face_ok", "blink_l", "blink_r", "ear_l", "ear_r",
+     "iris_d_px_l", "iris_d_px_r", "head_dist_rel",
+     "pupil_d_px_l", "pupil_d_px_r", "pupil_iris_l", "pupil_iris_r"],
 );
+
+// Per-trial display and sampler timing, so dropped frames or slow gaze sampling
+// can be checked as confounds (and as a cause of gaps in the gaze stream).
+const LONG_FRAME_MS = 50;
+const TrialTiming = (() => {
+    let rafId = 0;
+    let start = 0;
+    let last = 0;
+    let frames = 0;
+    let longFrames = 0;
+    let maxFrame = 0;
+
+    const tick = (now) => {
+        if (last) {
+            const dt = now - last;
+            if (dt > LONG_FRAME_MS) longFrames++;
+            if (dt > maxFrame) maxFrame = dt;
+        }
+        last = now;
+        frames++;
+        rafId = requestAnimationFrame(tick);
+    };
+
+    const rate = (samples) => {
+        const t = (samples || []).map((s) => s.t).filter(Number.isFinite);
+        if (t.length < 2) return { n: t.length, hz: null, maxGap: null };
+        let maxGap = 0;
+        for (let i = 1; i < t.length; i++) maxGap = Math.max(maxGap, t[i] - t[i - 1]);
+        const span = t[t.length - 1] - t[0];
+        return {
+            n: t.length,
+            hz: span > 0 ? Math.round(((t.length - 1) / span) * 10000) / 10 : null,
+            maxGap: Math.round(maxGap),
+        };
+    };
+
+    const cameraSettings = () => {
+        const vid = document.getElementById("webgazerVideoFeed");
+        const track = vid && vid.srcObject && vid.srcObject.getVideoTracks
+            ? vid.srcObject.getVideoTracks()[0]
+            : null;
+        const s = track && track.getSettings ? track.getSettings() : {};
+        return {
+            cam_fps: s.frameRate != null ? Math.round(s.frameRate * 10) / 10 : null,
+            cam_w: s.width != null ? s.width : (vid ? vid.videoWidth || null : null),
+            cam_h: s.height != null ? s.height : (vid ? vid.videoHeight || null : null),
+        };
+    };
+
+    const begin = () => {
+        if (rafId) cancelAnimationFrame(rafId);
+        start = performance.now();
+        last = 0;
+        frames = 0;
+        longFrames = 0;
+        maxFrame = 0;
+        rafId = requestAnimationFrame(tick);
+    };
+
+    // call after webgazer_data / iris_data are on the trial
+    const end = (data) => {
+        if (rafId) cancelAnimationFrame(rafId);
+        rafId = 0;
+        const elapsed = performance.now() - start;
+        const wg = rate(data.webgazer_data);
+        const iris = rate(data.iris_data);
+        const irisSamples = data.iris_data || [];
+        return Object.assign({
+            raf_fps: elapsed > 0 ? Math.round((frames / (elapsed / 1000)) * 10) / 10 : null,
+            long_frames: longFrames,
+            max_frame_ms: Math.round(maxFrame),
+            wg_n: wg.n,
+            wg_hz: wg.hz,
+            wg_max_gap_ms: wg.maxGap,
+            iris_n: iris.n,
+            iris_hz: iris.hz,
+            iris_face_ok: irisSamples.length
+                ? Math.round((irisSamples.filter((s) => s.face_ok === 1).length / irisSamples.length) * 1000) / 1000
+                : null,
+        }, cameraSettings());
+    };
+
+    return { begin, end };
+})();
+
+const median = (values) => {
+    if (!values.length) return null;
+    const s = values.slice().sort((a, b) => a - b);
+    const m = Math.floor(s.length / 2);
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+};
+
+// Accuracy from the validation plugin's raw_gaze (one array of {dx, dy} per point).
+// The plugin's own average_offset.r uses a buggy even-length median, so recompute here.
+const summarizeValidation = (rawGaze, roiRadius) => {
+    const points = Array.isArray(rawGaze) ? rawGaze : [];
+    const all = [];
+    const perPoint = points.map((samples) => {
+        const d = (samples || []).map((s) => Math.hypot(s.dx, s.dy)).filter(Number.isFinite);
+        all.push(...d);
+        const m = median(d);
+        return m == null ? null : Math.round(m);
+    });
+    const mean = all.length ? all.reduce((a, b) => a + b, 0) / all.length : null;
+    return {
+        val_n_samples: all.length,
+        val_median_offset_px: all.length ? Math.round(median(all)) : null,
+        val_mean_offset_px: mean == null ? null : Math.round(mean),
+        val_pct_in_roi: all.length
+            ? Math.round((all.filter((d) => d <= roiRadius).length / all.length) * 1000) / 10
+            : null,
+        val_point_median_px: perPoint,
+    };
+};
 
 // layout on screen at trial time t (the first one if t precedes every entry)
 const layoutAt = (layouts, t) => {
@@ -202,6 +348,10 @@ const eventRows = (trial) => {
         rows.push(row);
     });
 
+    (trial.iris_data || []).forEach((s) => {
+        rows.push(Object.assign({ row_type: "iris" }, base, s));
+    });
+
     return rows;
 };
 
@@ -229,6 +379,7 @@ const jsPsych = initJsPsych({
     // runs once, after the demographic questions — the only point data is saved
     on_finish: () => {
         if (jsPsych.extensions.webgazer) jsPsych.extensions.webgazer.pause();
+        if (window.SpinnerIris) window.SpinnerIris.pause();
         const csv = buildSessionCsv(jsPsych.data.get().values());
         document.body.innerHTML =
             `<div class="session-done" align='center' style="margin: 10%">
@@ -248,7 +399,8 @@ const jsPsych = initJsPsych({
                 })
                 .catch((err) => {
                     console.error(err);
-                    status.textContent = "Your data could not be saved. Please tell the experimenter.";
+                    const why = err && err.message ? ` ${err.message}` : "";
+                    status.textContent = `Your data could not be saved. Please tell the experimenter.${why}`;
                     again.hidden = false;
                 });
         };

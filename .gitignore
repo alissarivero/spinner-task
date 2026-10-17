@@ -1,0 +1,8 @@
+.DS_Store
+
+# participant data and generated outputs stay local
+Analysis/*.csv
+Analysis/*.html
+Analysis/*.json
+sample_data/
+docs/*.docx

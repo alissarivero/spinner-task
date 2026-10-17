@@ -1,0 +1,1623 @@
+---
+title: "Spinner task: confirmatory analyses, gaze, and gazemaps"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+    fig_width: 7
+    fig_height: 5
+---
+
+# Purpose
+
+This file reads session CSVs (one event per row, `row_type` = trial / spin / shape / gaze), builds analysis tables at the correct observational level, and fits confirmatory models that treat **spinner type as a 6-level factor**.
+
+Same-round liking is a separate dependent variable, not a covariate in the flow model. Round-level reward prediction error and surprise are **not** tested as if they were unexpected outcomes (they are nearly recodings of spinner type). Sample-to-sample gaze “switching” is not treated as attention switching.
+
+A later section treats **eye-tracking summaries as DVs** and asks how they correlate with, and are predicted by, same-round flow, liking, and happiness (hierarchical models with a participant intercept).
+
+**Nothing is written to disk.** Exploratory material that cannot support inference is in the appendix.
+
+# 1. Packages
+
+```{r setup, message=FALSE, warning=FALSE}
+required_packages <- c(
+  "tidyverse",
+  "lme4",
+  "lmerTest",
+  "ordinal",
+  "emmeans",
+  "broom",
+  "broom.mixed",
+  "jsonlite"
+)
+
+missing_packages <- setdiff(required_packages, rownames(installed.packages()))
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing packages: ", paste(missing_packages, collapse = ", "),
+    ". Install them, then re-knit. This file does not call install.packages()."
+  )
+}
+
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(ordinal)
+library(emmeans)
+library(broom)
+library(broom.mixed)
+
+# Later packages can mask dplyr generics (slice/select/filter).
+select <- dplyr::select
+filter <- dplyr::filter
+mutate <- dplyr::mutate
+summarise <- dplyr::summarise
+summarize <- dplyr::summarise
+slice <- dplyr::slice
+rename <- dplyr::rename
+
+WHEEL_LEVELS <- c("all1", "low", "medium", "high", "half51", "all5")
+E3_LEVELS <- c("low", "medium", "high", "half51")
+
+FALLBACK_ORDERS <- list(
+  high   = c(5, 2, 1, 4, 2, 2, 5, 1, 4, 4, 1, 5),
+  medium = c(4, 4, 2, 2, 2, 4, 4, 2, 4, 4, 2, 2),
+  half51 = c(1, 5, 5, 1, 5, 5, 5, 1, 1, 1, 1, 5)
+)
+
+parse_outcome_order <- function(x) {
+  if (length(x) == 0 || is.na(x) || !nzchar(x)) return(numeric(0))
+  vals <- suppressWarnings(as.numeric(strsplit(as.character(x), "-", fixed = TRUE)[[1]]))
+  vals[is.finite(vals)]
+}
+
+programmed_rewards <- function(spinner_type, high_ord, medium_ord, half51_ord) {
+  if (is.na(spinner_type)) return(numeric(0))
+  switch(
+    spinner_type,
+    low    = rep(3, 12),
+    all1   = rep(1, 12),
+    all5   = rep(5, 12),
+    high   = {
+      x <- parse_outcome_order(high_ord)
+      if (length(x)) x else FALLBACK_ORDERS$high
+    },
+    medium = {
+      x <- parse_outcome_order(medium_ord)
+      if (length(x)) x else FALLBACK_ORDERS$medium
+    },
+    half51 = {
+      x <- parse_outcome_order(half51_ord)
+      if (length(x)) x else FALLBACK_ORDERS$half51
+    },
+    numeric(0)
+  )
+}
+
+reward_entropy <- function(x) {
+  if (length(x) == 0) return(NA_real_)
+  p <- as.numeric(table(x) / length(x))
+  -sum(p * log(p))
+}
+
+is_main_task_row <- function(spinner_type, phase, bonus_round, round) {
+  !is.na(spinner_type) &
+    spinner_type %in% WHEEL_LEVELS &
+    !is.na(round) &
+    is.na(bonus_round) &
+    (is.na(phase) | !phase %in% c("spin_practice", "bonus"))
+}
+
+# Gaussian mixed model; ordinary lm if only one participant (random intercept unidentified).
+fit_gaussian <- function(formula, data, cluster = "participant_id") {
+  n_id <- dplyr::n_distinct(data[[cluster]])
+  if (n_id >= 2) {
+    fit <- try(lmerTest::lmer(formula, data = data, REML = TRUE), silent = TRUE)
+    if (!inherits(fit, "try-error")) return(fit)
+    message("lmer failed (", conditionMessage(attr(fit, "condition")), "); using lm.")
+  } else {
+    message("Only ", n_id, " participant(s): fitting lm without a random intercept.")
+  }
+  lm(lme4::nobars(formula), data = data)
+}
+
+fit_ordinal <- function(formula, data, cluster = "participant_id") {
+  n_id <- dplyr::n_distinct(data[[cluster]])
+  n_lev <- nlevels(data$flow_ord)
+  if (n_id < 2) {
+    message("Ordinal mixed model skipped: need at least 2 participants (have ", n_id, ").")
+    return(NULL)
+  }
+  if (n_lev < 3) {
+    message("Ordinal mixed model skipped: ordered flow has ", n_lev, " level(s).")
+    return(NULL)
+  }
+  fit <- try(ordinal::clmm(formula, data = data, Hess = TRUE), silent = TRUE)
+  if (inherits(fit, "try-error")) {
+    message("clmm failed: ", conditionMessage(attr(fit, "condition")))
+    return(NULL)
+  }
+  fit
+}
+
+summarize_fit <- function(model) {
+  if (is.null(model)) return(invisible(NULL))
+  print(summary(model))
+  invisible(model)
+}
+
+spinner_contrasts <- function(model) {
+  if (is.null(model)) return(invisible(NULL))
+  emm <- try(emmeans::emmeans(model, ~ spinner_type), silent = TRUE)
+  if (inherits(emm, "try-error")) {
+    message("emmeans skipped: ", conditionMessage(attr(emm, "condition")))
+    return(invisible(NULL))
+  }
+  cat("\nEstimated marginal means\n")
+  print(emm)
+  levs <- as.character(emm@levels$spinner_type)
+  coef_in_order <- function(...) {
+    v <- c(...)
+    out <- setNames(rep(0, length(levs)), levs)
+    common <- intersect(names(v), names(out))
+    out[common] <- v[common]
+    unname(out)
+  }
+  mag <- emmeans::contrast(emm, method = list(
+    all5_vs_all1 = coef_in_order(all5 = 1, all1 = -1),
+    e3_vs_extremes = coef_in_order(
+      low = 0.25, medium = 0.25, high = 0.25, half51 = 0.25,
+      all1 = -0.5, all5 = -0.5
+    )
+  ))
+  cat("\nMagnitude contrasts\n")
+  print(mag)
+  e3_levs <- intersect(E3_LEVELS, levs)
+  if (length(e3_levs) >= 2) {
+    emm_e3 <- emmeans::emmeans(model, ~ spinner_type, at = list(spinner_type = e3_levs))
+    cat("\nUncertainty pairwise (E[reward] = 3 wheels)\n")
+    print(pairs(emm_e3, adjust = "holm"))
+  }
+  invisible(list(emm = emm, magnitude = mag))
+}
+
+theme_set(theme_classic())
+```
+
+# 2. Import
+
+Looks in `Analysis/` first, then `../sample_data`. New DataPipe files have `row_type`. The older wide sample (`webgazer_data` JSON on trial rows) is expanded into gaze rows.
+
+```{r import}
+candidate_dirs <- c(".", "../sample_data")
+data_dir <- NA_character_
+csv_files <- character(0)
+for (dir in candidate_dirs) {
+  found <- list.files(dir, pattern = "\\.csv$", full.names = TRUE, recursive = FALSE)
+  if (length(found) > 0) {
+    data_dir <- dir
+    csv_files <- found
+    break
+  }
+}
+
+if (length(csv_files) == 0) {
+  stop(
+    "No .csv files in Analysis/ or ../sample_data. ",
+    "Put session CSVs next to this Rmd and knit again."
+  )
+}
+
+# Older jsPsych export: one trial per row, gaze packed in webgazer_data JSON.
+expand_legacy_csv <- function(d) {
+  if ("row_type" %in% names(d)) return(d)
+  d$row_type <- "trial"
+  if (!"webgazer_data" %in% names(d)) return(d)
+  carry <- intersect(
+    c(
+      "subject", "run_mode", "session_code", "source_file", "trial_index",
+      "phase", "spinner_type", "round", "bonus_round", "order"
+    ),
+    names(d)
+  )
+  gaze <- purrr::map_dfr(seq_len(nrow(d)), function(i) {
+    js <- d$webgazer_data[[i]]
+    if (is.na(js) || !nzchar(js) || js %in% c("[]", "{}", "\"\"")) return(tibble())
+    pts <- try(jsonlite::fromJSON(js), silent = TRUE)
+    if (inherits(pts, "try-error") || is.null(pts)) return(tibble())
+    pts <- tibble::as_tibble(pts)
+    if (nrow(pts) == 0 || !all(c("x", "y") %in% names(pts))) return(tibble())
+    out <- tibble(row_type = "gaze", gaze_x = pts$x, gaze_y = pts$y)
+    out$t <- if ("t" %in% names(pts)) pts$t else NA_real_
+    for (nm in carry) out[[nm]] <- d[[nm]][[i]]
+    out
+  })
+  dplyr::bind_rows(d, gaze)
+}
+
+cat("Folder:", normalizePath(data_dir, mustWork = FALSE), "\n")
+cat("CSV files:\n")
+print(basename(csv_files))
+
+data_list <- purrr::map(csv_files, function(path) {
+  d <- readr::read_csv(
+    path,
+    col_types = readr::cols(.default = readr::col_character()),
+    na = c("", "NA", "NaN", "NULL"),
+    show_col_types = FALSE
+  )
+  d$source_file <- basename(path)
+  expand_legacy_csv(d)
+})
+
+data <- dplyr::bind_rows(data_list)
+rm(data_list)
+
+cat("Rows:", nrow(data), "  columns:", ncol(data), "\n")
+if ("row_type" %in% names(data)) print(count(data, row_type))
+```
+
+# 3. Clean types
+
+`subject`, `session_code`, `run_mode`, `phase`, `near_edge`, and spinner labels stay character.
+
+```{r cleaning}
+for (nm in c("session_code", "phase", "bonus_round", "round", "spinner_type",
+             "high_outcome_order", "medium_outcome_order", "half51_outcome_order",
+             "t_start", "t_land", "spin_index", "outcome", "hold_ms")) {
+  if (!nm %in% names(data)) data[[nm]] <- NA_character_
+}
+
+char_keep <- intersect(
+  c(
+    "row_type", "subject", "run_mode", "session_code", "source_file",
+    "phase", "trial_type", "internal_node_id", "user_agent",
+    "spinner_type", "order_perm", "chosen_spinner",
+    "high_outcome_order", "medium_outcome_order", "half51_outcome_order",
+    "distractor_seed", "distractor_schedule",
+    "response", "liking_label", "happiness_label", "view_history",
+    "near_edge", "neighbor_outcome", "shape", "shape_trigger",
+    # validation trials store JSON arrays
+    "average_offset", "validation_points", "percent_in_roi", "val_point_median_px",
+    "eye_tracking"
+  ),
+  names(data)
+)
+
+numeric_variables <- setdiff(names(data), char_keep)
+
+data <- data %>%
+  mutate(
+    across(where(is.character), ~ na_if(str_squish(.x), "")),
+    across(all_of(numeric_variables), ~ suppressWarnings(readr::parse_number(.x)))
+  ) %>%
+  mutate(
+    participant_id = as.character(subject),
+    # session_code is only on trial rows; one CSV = one session
+    session_id = paste(participant_id, source_file, sep = "|"),
+    spinner_type = factor(spinner_type, levels = WHEEL_LEVELS),
+    main_task = is_main_task_row(as.character(spinner_type), phase, bonus_round, round)
+  )
+
+session_quality <- data %>%
+  group_by(session_id, participant_id) %>%
+  summarise(
+    # run_mode is only on trial rows
+    run_mode = dplyr::first(na.omit(run_mode)),
+    n_gaze = sum(row_type == "gaze", na.rm = TRUE),
+    n_spin = sum(row_type == "spin", na.rm = TRUE),
+    n_trial = sum(row_type == "trial", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    is_test = !is.na(run_mode) & run_mode == "test",
+    has_gaze = n_gaze > 0
+  )
+
+cat("Sessions:\n")
+print(session_quality)
+```
+
+# 4. Programmed reward properties
+
+Parsed from `high_outcome_order` / `medium_outcome_order` / `half51_outcome_order` on each session (seed-42 fallback if those cells are empty). These describe the **design**, not experienced luck.
+
+```{r reward-properties}
+session_design <- data %>%
+  group_by(session_id) %>%
+  summarise(
+    high_outcome_order = { x <- high_outcome_order[!is.na(high_outcome_order)]; if (length(x)) x[1] else NA_character_ },
+    medium_outcome_order = { x <- medium_outcome_order[!is.na(medium_outcome_order)]; if (length(x)) x[1] else NA_character_ },
+    half51_outcome_order = { x <- half51_outcome_order[!is.na(half51_outcome_order)]; if (length(x)) x[1] else NA_character_ },
+    .groups = "drop"
+  )
+
+wheel_design <- tidyr::expand_grid(
+  session_id = session_design$session_id,
+  spinner_type = WHEEL_LEVELS
+) %>%
+  left_join(session_design, by = "session_id") %>%
+  rowwise() %>%
+  mutate(
+    programmed = list(programmed_rewards(
+      spinner_type, high_outcome_order, medium_outcome_order, half51_outcome_order
+    )),
+    expected_reward = if (length(programmed)) mean(programmed) else NA_real_,
+    reward_variance = if (length(programmed) > 1) var(programmed) else if (length(programmed) == 1) 0 else NA_real_,
+    reward_entropy = reward_entropy(programmed)
+  ) %>%
+  ungroup() %>%
+  select(-programmed, -high_outcome_order, -medium_outcome_order, -half51_outcome_order) %>%
+  mutate(spinner_type = factor(spinner_type, levels = WHEEL_LEVELS))
+
+wheel_design %>%
+  distinct(spinner_type, expected_reward, reward_variance, reward_entropy) %>%
+  arrange(expected_reward, reward_variance)
+```
+
+Note: `all1`, `low`, and `all5` all have variance 0 but different means (1, 3, 5). `medium` and `half51` have the same entropy and different variance. Confirmatory models use `spinner_type`, not variance.
+
+# 5. Analysis tables
+
+One row per session × round for ratings. Gaze is **not** copied onto those rows until a later join of summaries.
+
+Confirmatory sample: main 6 wheels, not test mode, not practice, not bonus.
+
+```{r analysis-tables}
+flow_items <- data %>%
+  filter(row_type == "trial", main_task, !is.na(flow)) %>%
+  select(session_id, participant_id, run_mode, round, spinner_type, flow, score, response)
+
+liking_items <- data %>%
+  filter(row_type == "trial", main_task, !is.na(liking)) %>%
+  select(session_id, round, liking)
+
+happiness_items <- data %>%
+  filter(row_type == "trial", main_task, !is.na(happiness)) %>%
+  select(session_id, round, happiness)
+
+spin_trials <- data %>%
+  filter(row_type == "trial", main_task, !is.na(n_spins)) %>%
+  group_by(session_id, round) %>%
+  dplyr::slice_min(trial_index, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(session_id, round, n_spins, score, spinner_type)
+
+rounds <- flow_items %>%
+  group_by(session_id, round) %>%
+  dplyr::slice_head(n = 1) %>%
+  ungroup() %>%
+  left_join(liking_items %>% group_by(session_id, round) %>% dplyr::slice_head(n = 1) %>% ungroup(),
+            by = c("session_id", "round")) %>%
+  left_join(happiness_items %>% group_by(session_id, round) %>% dplyr::slice_head(n = 1) %>% ungroup(),
+            by = c("session_id", "round")) %>%
+  left_join(spin_trials %>% select(session_id, round, n_spins),
+            by = c("session_id", "round"),
+            suffix = c("", "_spin")) %>%
+  left_join(session_quality %>% select(session_id, is_test, has_gaze, n_gaze),
+            by = "session_id") %>%
+  left_join(wheel_design, by = c("session_id", "spinner_type")) %>%
+  mutate(
+    spinner_type = factor(spinner_type, levels = WHEEL_LEVELS),
+    stopped_early = !is.na(n_spins) & n_spins < 12,
+    confirmatory = !is_test
+  )
+
+rounds_c <- rounds %>% filter(confirmatory)
+
+spins <- data %>%
+  filter(row_type == "spin", main_task) %>%
+  left_join(session_quality %>% select(session_id, is_test, has_gaze), by = "session_id") %>%
+  left_join(wheel_design, by = c("session_id", "spinner_type")) %>%
+  mutate(
+    spinner_type = factor(spinner_type, levels = WHEEL_LEVELS),
+    spin_duration_ms = t_land - t_start,
+    rpe_design = outcome - expected_reward,
+    abs_rpe_design = abs(rpe_design)
+  )
+
+# Outcome probability from the session's programmed list
+order_lookup <- session_design %>%
+  mutate(
+    seq_high = map(high_outcome_order, parse_outcome_order),
+    seq_medium = map(medium_outcome_order, parse_outcome_order),
+    seq_half51 = map(half51_outcome_order, parse_outcome_order)
+  )
+
+spins <- spins %>%
+  left_join(order_lookup %>% select(session_id, seq_high, seq_medium, seq_half51),
+            by = "session_id") %>%
+  mutate(
+    programmed = purrr::pmap(
+      list(as.character(spinner_type), seq_high, seq_medium, seq_half51),
+      function(st, h, m, f) programmed_rewards(
+        st,
+        paste(h, collapse = "-"),
+        paste(m, collapse = "-"),
+        paste(f, collapse = "-")
+      )
+    ),
+    observed_outcome_probability = purrr::map2_dbl(programmed, outcome, function(seqn, out) {
+      if (length(seqn) == 0 || is.na(out)) return(NA_real_)
+      mean(seqn == out)
+    }),
+    outcome_surprise = if_else(
+      !is.na(observed_outcome_probability) & observed_outcome_probability > 0,
+      -log(observed_outcome_probability),
+      NA_real_
+    )
+  ) %>%
+  select(-programmed, -seq_high, -seq_medium, -seq_half51)
+
+spins_c <- spins %>% filter(!is_test)
+
+# Gaze rows sometimes omit spinner_type / round; copy from the parent trial.
+if (all(c("session_id", "trial_index") %in% names(data))) {
+  trial_design <- data %>%
+    filter(row_type == "trial") %>%
+    select(any_of(c(
+      "session_id", "trial_index", "spinner_type", "round", "phase", "bonus_round"
+    ))) %>%
+    distinct() %>%
+    rename_with(~ paste0(., "_tr"), -any_of(c("session_id", "trial_index")))
+  if (nrow(trial_design) > 0) {
+    data <- data %>%
+      left_join(trial_design, by = intersect(c("session_id", "trial_index"), names(trial_design)))
+    if ("spinner_type_tr" %in% names(data)) {
+      data$spinner_type <- factor(
+        coalesce(as.character(data$spinner_type), as.character(data$spinner_type_tr)),
+        levels = WHEEL_LEVELS
+      )
+    }
+    if ("round_tr" %in% names(data)) {
+      data$round <- coalesce(data$round, suppressWarnings(as.numeric(data$round_tr)))
+    }
+    if ("phase_tr" %in% names(data)) {
+      data$phase <- coalesce(data$phase, data$phase_tr)
+    }
+    if ("bonus_round_tr" %in% names(data)) {
+      data$bonus_round <- coalesce(
+        data$bonus_round,
+        suppressWarnings(as.numeric(data$bonus_round_tr))
+      )
+    }
+    data$main_task <- is_main_task_row(
+      as.character(data$spinner_type), data$phase, data$bonus_round, data$round
+    )
+    data <- data %>% select(-ends_with("_tr"))
+  }
+}
+
+gaze_raw <- data %>% filter(row_type == "gaze")
+for (nm in c(
+  "wheel_x", "wheel_y", "wheel_r", "needle_x", "needle_y", "needle_w", "needle_h",
+  "spinning", "shape_visible"
+)) {
+  if (!nm %in% names(gaze_raw)) gaze_raw[[nm]] <- NA_real_
+}
+gaze_xy <- gaze_raw %>%
+  filter(!is.na(gaze_x), !is.na(gaze_y)) %>%
+  left_join(session_quality %>% select(session_id, is_test, has_gaze), by = "session_id") %>%
+  mutate(
+    spinner_type = factor(spinner_type, levels = WHEEL_LEVELS),
+    has_wheel = !is.na(wheel_x) & !is.na(wheel_y) & !is.na(wheel_r) & wheel_r > 0,
+    wx = if_else(has_wheel, (gaze_x - wheel_x) / wheel_r, NA_real_),
+    wy = if_else(has_wheel, (gaze_y - wheel_y) / wheel_r, NA_real_),
+    nx = if_else(has_wheel, (needle_x - wheel_x) / wheel_r, NA_real_),
+    ny = if_else(has_wheel, (needle_y - wheel_y) / wheel_r, NA_real_),
+    nw = if_else(has_wheel, needle_w / wheel_r, NA_real_),
+    nh = if_else(has_wheel, needle_h / wheel_r, NA_real_),
+    ecc = sqrt(wx^2 + wy^2)
+  )
+
+cat("Gaze inclusion\n")
+cat("  row_type == gaze:", nrow(gaze_raw), "\n")
+cat("  with x,y:", nrow(gaze_xy), "\n")
+cat("  main_task:", sum(gaze_xy$main_task %in% TRUE), "\n")
+cat("  wheel layout:", sum(gaze_xy$has_wheel %in% TRUE), "\n")
+cat("  ecc < 3:", sum(is.finite(gaze_xy$ecc) & gaze_xy$ecc < 3), "\n")
+if ("spinning" %in% names(gaze_xy)) {
+  cat("  spinning == 1:", sum(gaze_xy$spinning == 1, na.rm = TRUE), "\n")
+}
+cat("  test sessions:", sum(gaze_xy$is_test %in% TRUE), "\n")
+
+gaze_ok <- gaze_xy %>%
+  filter(main_task %in% TRUE, has_wheel %in% TRUE, is.finite(ecc), ecc < 3)
+
+if (nrow(gaze_ok) == 0) {
+  gaze_ok <- gaze_xy %>% filter(main_task %in% TRUE, has_wheel %in% TRUE, is.finite(wx))
+  if (nrow(gaze_ok) > 0) message("ecc < 3 dropped every sample; using all wheel-centered gaze.")
+}
+if (nrow(gaze_ok) == 0) {
+  gaze_ok <- gaze_xy %>% filter(has_wheel %in% TRUE, is.finite(wx))
+  if (nrow(gaze_ok) > 0) message("No main-task wheel gaze; using any wheel-centered gaze.")
+}
+if (nrow(gaze_ok) == 0 && nrow(gaze_xy) > 0) {
+  gaze_ok <- gaze_xy %>%
+    group_by(session_id, trial_index) %>%
+    mutate(
+      wx = (gaze_x - median(gaze_x, na.rm = TRUE)) / pmax(IQR(gaze_x, na.rm = TRUE), 1),
+      wy = (gaze_y - median(gaze_y, na.rm = TRUE)) / pmax(IQR(gaze_y, na.rm = TRUE), 1),
+      ecc = sqrt(wx^2 + wy^2)
+    ) %>%
+    ungroup()
+  message("No wheel layout on gaze rows; maps are trial-centered (not wheel radii).")
+}
+
+gaze_spin <- gaze_ok %>% filter(spinning == 1)
+gaze_shape <- gaze_ok %>% filter(shape_visible == 1)
+gaze_idle <- gaze_ok %>% filter(is.na(spinning) | spinning != 1)
+
+n_participants <- n_distinct(rounds_c$participant_id)
+n_rounds <- nrow(rounds_c)
+
+cat(
+  "Confirmatory rounds:", n_rounds,
+  "  participants:", n_participants, "\n",
+  "Spins:", nrow(spins_c),
+  "  gaze while spinning:", nrow(gaze_spin),
+  "  gaze while shape visible:", nrow(gaze_shape), "\n"
+)
+
+count(rounds_c, spinner_type)
+```
+
+# 6. Descriptives
+
+```{r descriptives}
+rounds_c %>%
+  group_by(spinner_type) %>%
+  summarise(
+    n = n(),
+    mean_flow = mean(flow, na.rm = TRUE),
+    sd_flow = sd(flow, na.rm = TRUE),
+    mean_liking = mean(liking, na.rm = TRUE),
+    mean_happiness = mean(happiness, na.rm = TRUE),
+    mean_n_spins = mean(n_spins, na.rm = TRUE),
+    prop_stopped_early = mean(stopped_early, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+spins_c %>%
+  group_by(spinner_type) %>%
+  summarise(
+    n_spins = n(),
+    mean_outcome = mean(outcome, na.rm = TRUE),
+    sd_outcome = sd(outcome, na.rm = TRUE),
+    mean_hold_ms = mean(hold_ms, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r plot-ratings-by-condition, fig.width=8, fig.height=8}
+plot_by_wheel <- function(df, y, ylab, title) {
+  ggplot(df, aes(x = spinner_type, y = .data[[y]], group = participant_id)) +
+    geom_line(alpha = 0.25) +
+    geom_point(alpha = 0.6) +
+    stat_summary(aes(group = 1), fun = mean, geom = "point", size = 3) +
+    labs(x = "Spinner type", y = ylab, title = title)
+}
+
+plot_by_wheel(rounds_c, "flow", "Flow (0–10)", "Flow by spinner type")
+plot_by_wheel(rounds_c, "liking", "Liking (1–5)", "Liking by spinner type")
+plot_by_wheel(rounds_c, "happiness", "Happiness (1–5)", "Happiness by spinner type")
+```
+
+```{r plot-flow-order}
+ggplot(rounds_c, aes(x = round, y = flow, group = participant_id)) +
+  geom_line(alpha = 0.3) +
+  geom_point(alpha = 0.6) +
+  stat_summary(aes(group = 1), fun = mean, geom = "line", linewidth = 1.1) +
+  labs(x = "Presentation order (round)", y = "Flow", title = "Flow across the session")
+```
+
+# 7. Confirmatory models
+
+Primary DV: flow. Predictor: `spinner_type` (6-level factor) plus presentation `round`. Random intercept for participant when two or more people are present.
+
+Liking is **not** in this model.
+
+```{r confirmatory-flow}
+flow_data <- rounds_c %>%
+  filter(!is.na(flow), !is.na(spinner_type), !is.na(round)) %>%
+  mutate(flow_ord = ordered(flow))
+
+flow_lmm <- fit_gaussian(flow ~ spinner_type + round + (1 | participant_id), flow_data)
+summarize_fit(flow_lmm)
+spinner_contrasts(flow_lmm)
+
+flow_clmm <- fit_ordinal(
+  flow_ord ~ spinner_type + round + (1 | participant_id),
+  flow_data
+)
+summarize_fit(flow_clmm)
+```
+
+## Liking (separate DV)
+
+```{r confirmatory-liking}
+liking_data <- rounds_c %>% filter(!is.na(liking), !is.na(spinner_type), !is.na(round))
+liking_lmm <- fit_gaussian(liking ~ spinner_type + round + (1 | participant_id), liking_data)
+summarize_fit(liking_lmm)
+spinner_contrasts(liking_lmm)
+```
+
+## Happiness (separate DV)
+
+```{r confirmatory-happiness}
+happiness_data <- rounds_c %>% filter(!is.na(happiness), !is.na(spinner_type), !is.na(round))
+happiness_lmm <- fit_gaussian(happiness ~ spinner_type + round + (1 | participant_id), happiness_data)
+summarize_fit(happiness_lmm)
+spinner_contrasts(happiness_lmm)
+```
+
+# 8. Persistence (secondary)
+
+`n_spins` is bounded 4–12 on main wheels. Linear mixed model on that scale, plus a binomial model of stopping before 12.
+
+```{r persistence}
+spin_n_data <- rounds_c %>% filter(!is.na(n_spins), !is.na(spinner_type))
+
+nspins_lmm <- fit_gaussian(n_spins ~ spinner_type + round + (1 | participant_id), spin_n_data)
+summarize_fit(nspins_lmm)
+spinner_contrasts(nspins_lmm)
+
+early_data <- spin_n_data %>% mutate(stopped_early = as.integer(stopped_early))
+if (n_distinct(early_data$participant_id) >= 2 && n_distinct(early_data$stopped_early) == 2) {
+  early_fit <- try(
+    glmer(
+      stopped_early ~ spinner_type + round + (1 | participant_id),
+      data = early_data,
+      family = binomial
+    ),
+    silent = TRUE
+  )
+  if (!inherits(early_fit, "try-error")) print(summary(early_fit)) else {
+    early_fit <- glm(stopped_early ~ spinner_type + round, data = early_data, family = binomial)
+    print(summary(early_fit))
+  }
+} else if (n_distinct(early_data$stopped_early) == 2) {
+  early_fit <- glm(stopped_early ~ spinner_type + round, data = early_data, family = binomial)
+  message("Binomial glm (no random intercept).")
+  print(summary(early_fit))
+} else {
+  cat("stopped_early has no variation; binomial model skipped.\n")
+}
+
+ggplot(spin_n_data, aes(x = spinner_type, y = n_spins, group = participant_id)) +
+  geom_line(alpha = 0.25) +
+  geom_point(alpha = 0.6) +
+  stat_summary(aes(group = 1), fun = mean, geom = "point", size = 3) +
+  labs(x = "Spinner type", y = "Spins (4–12)", title = "Persistence by spinner type")
+```
+
+# Eye-tracking QC (data quality)
+
+Accuracy comes from the 5-point checks right after calibration (`pre`) and after the bonus spin (`post`). The gaze model is frozen after calibration (no click or mouse retraining), so post minus pre is drift. Offsets are viewport px, the same space as `gaze_x` / `gaze_y`. Timing (display frame rate, long frames over 50 ms, WebGazer and Face Landmarker sample rates) is logged per gaze-tracked trial and summarized over main-task wheels.
+
+Provisional flags, reported only (nobody is excluded yet): pre-check median offset > 200 px, or median WebGazer rate < 15 Hz. Older sessions without these fields show `NA`.
+
+```{r eyetracking-qc}
+qc_data <- data
+for (nm in c("val_median_offset_px", "val_mean_offset_px", "val_pct_in_roi", "samples_per_sec",
+             "wg_hz", "iris_hz", "raf_fps", "long_frames", "wg_max_gap_ms", "iris_face_ok", "cam_fps")) {
+  if (!nm %in% names(qc_data)) qc_data[[nm]] <- NA_real_
+}
+
+val_rows <- qc_data %>%
+  filter(row_type == "trial", phase %in% c("eyetracking_validation_pre", "eyetracking_validation_post")) %>%
+  transmute(
+    session_id, participant_id,
+    check = sub("eyetracking_validation_", "", phase),
+    median_px = val_median_offset_px,
+    mean_px = val_mean_offset_px,
+    pct_in_roi = val_pct_in_roi,
+    val_hz = samples_per_sec
+  )
+
+val_wide <- if (nrow(val_rows)) {
+  val_rows %>%
+    group_by(session_id, participant_id, check) %>%
+    dplyr::slice_tail(n = 1) %>%
+    ungroup() %>%
+    pivot_wider(names_from = check, values_from = c(median_px, mean_px, pct_in_roi, val_hz),
+                names_glue = "{.value}_{check}")
+} else {
+  tibble(session_id = character(), participant_id = character())
+}
+for (nm in c("median_px_pre", "median_px_post", "mean_px_pre", "mean_px_post",
+             "pct_in_roi_pre", "pct_in_roi_post")) {
+  if (!nm %in% names(val_wide)) val_wide[[nm]] <- NA_real_
+}
+
+timing_qc <- qc_data %>%
+  filter(row_type == "trial", main_task) %>%
+  group_by(session_id, participant_id) %>%
+  summarise(
+    wg_hz_med = median(wg_hz, na.rm = TRUE),
+    iris_hz_med = median(iris_hz, na.rm = TRUE),
+    raf_fps_med = median(raf_fps, na.rm = TRUE),
+    long_frames_per_wheel = mean(long_frames, na.rm = TRUE),
+    wg_max_gap_ms_med = median(wg_max_gap_ms, na.rm = TRUE),
+    iris_face_ok_mean = mean(iris_face_ok, na.rm = TRUE),
+    cam_fps = suppressWarnings(max(cam_fps, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ if_else(is.finite(.x), .x, NA_real_)))
+
+eyetracking_qc <- qc_data %>%
+  group_by(session_id, participant_id) %>%
+  summarise(
+    is_test = any(!is.na(run_mode) & run_mode == "test"),
+    has_gaze = any(row_type == "gaze", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(val_wide, by = c("session_id", "participant_id")) %>%
+  left_join(timing_qc, by = c("session_id", "participant_id")) %>%
+  mutate(
+    drift_px = median_px_post - median_px_pre,
+    flag_accuracy = !is.na(median_px_pre) & median_px_pre > 200,
+    flag_rate = !is.na(wg_hz_med) & wg_hz_med < 15,
+    qc_flag = flag_accuracy | flag_rate
+  )
+
+eyetracking_qc %>%
+  select(participant_id, is_test, median_px_pre, median_px_post, drift_px,
+         pct_in_roi_pre, pct_in_roi_post, wg_hz_med, iris_hz_med, raf_fps_med,
+         long_frames_per_wheel, wg_max_gap_ms_med, cam_fps, qc_flag) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 1))) %>%
+  knitr::kable()
+```
+
+# 9. Gaze during spins (secondary)
+
+AOI proportions are computed only while `spinning == 1`. Needle vs wheel are compositional (`prop_needle + prop_other = 1` if other includes wheel). Models use **prop_needle** only.
+
+Sessions with no gaze (eye-tracking bypass) are flagged, not silently dropped from the rating models above.
+
+```{r gaze-spin-summary}
+gaze_round <- gaze_spin %>%
+  filter(!is_test) %>%
+  group_by(session_id, participant_id, round, spinner_type) %>%
+  summarise(
+    n_samples = n(),
+    prop_needle = mean(on_needle == 1, na.rm = TRUE),
+    mean_dist_needle = mean(dist_needle, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(rounds_c %>% select(session_id, round, flow, liking, has_gaze),
+            by = c("session_id", "round"))
+
+gaze_round %>%
+  group_by(spinner_type) %>%
+  summarise(
+    n = n(),
+    mean_prop_needle = mean(prop_needle, na.rm = TRUE),
+    mean_dist_needle = mean(mean_dist_needle, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+if (nrow(gaze_round) > 0) {
+  needle_cond <- fit_gaussian(
+    prop_needle ~ spinner_type + (1 | participant_id),
+    gaze_round
+  )
+  summarize_fit(needle_cond)
+  spinner_contrasts(needle_cond)
+
+  needle_flow <- gaze_round %>% filter(!is.na(flow))
+  if (nrow(needle_flow) > 0) {
+    needle_flow_m <- fit_gaussian(
+      prop_needle ~ flow + spinner_type + (1 | participant_id),
+      needle_flow
+    )
+    summarize_fit(needle_flow_m)
+  }
+} else {
+  cat("No spinning gaze samples in the confirmatory sessions.\n")
+}
+```
+
+```{r plot-needle}
+if (nrow(gaze_round) > 0) {
+  ggplot(gaze_round, aes(x = spinner_type, y = prop_needle, group = participant_id)) +
+    geom_line(alpha = 0.25) +
+    geom_point(alpha = 0.6) +
+    stat_summary(aes(group = 1), fun = mean, geom = "point", size = 3) +
+    labs(
+      x = "Spinner type",
+      y = "Proportion of spinning samples on needle",
+      title = "Needle AOI during spins"
+    )
+}
+```
+
+## Distance to needle as the wheel slows (descriptive)
+
+```{r time-to-land}
+gaze_ttl <- gaze_spin %>% filter(FALSE)
+if (nrow(gaze_spin) > 0 &&
+    all(c("t_land", "spin_index") %in% names(spins_c)) &&
+    all(c("spin_index", "t") %in% names(gaze_spin))) {
+  land_times <- spins_c %>%
+    select(session_id, round, spin_index, spin_t_land = t_land)
+  gaze_ttl <- gaze_spin %>%
+    filter(is.na(is_test) | !is_test) %>%
+    left_join(land_times, by = c("session_id", "round", "spin_index")) %>%
+    filter(!is.na(spin_t_land), !is.na(t), t <= spin_t_land) %>%
+    mutate(
+      ms_to_land = spin_t_land - t,
+      bin = cut(
+        ms_to_land,
+        breaks = c(-Inf, 250, 500, 1000, 2000, 4000, Inf),
+        labels = c("0–250", "250–500", "500–1000", "1–2 s", "2–4 s", ">4 s")
+      )
+    )
+} else {
+  cat("Time-to-land skipped: no t_land / spin_index on this file.\n")
+}
+
+if (nrow(gaze_ttl) > 0) {
+  ttl_summary <- gaze_ttl %>%
+    group_by(spinner_type, bin) %>%
+    summarise(mean_dist_needle = mean(dist_needle, na.rm = TRUE), n = n(), .groups = "drop")
+
+  print(ttl_summary)
+
+  ggplot(ttl_summary, aes(x = bin, y = mean_dist_needle, group = spinner_type, color = spinner_type)) +
+    geom_line() +
+    geom_point() +
+    labs(
+      x = "Time to land",
+      y = "Mean distance to needle (px)",
+      color = "Spinner",
+      title = "Needle distance over the coast (descriptive)"
+    ) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+}
+```
+
+# 10. Distractor capture (secondary)
+
+Only while `shape_visible == 1`. Baseline is the same spin, same shape coordinates, when the shape is off. Jitter and `cut_short` are not DVs.
+
+```{r distractor-capture}
+shape_radius <- function(size) size / 2
+
+gaze_shape_cmp <- gaze_ok %>%
+  filter(!is_test, !is.na(dist_shape), !is.na(spin_index), !is.na(shape_visible)) %>%
+  mutate(on_shape = dist_shape <= shape_radius(shape_size)) %>%
+  group_by(session_id, participant_id, round, spinner_type, spin_index, shape_visible) %>%
+  summarise(
+    n = n(),
+    mean_dist_shape = mean(dist_shape, na.rm = TRUE),
+    prop_on_shape = mean(on_shape, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(visible = factor(if_else(shape_visible == 1, "visible", "off"),
+                          levels = c("off", "visible")))
+
+pair_cols <- c(
+  "mean_dist_shape_visible", "mean_dist_shape_off",
+  "prop_on_shape_visible", "prop_on_shape_off"
+)
+
+capture_wide <- if (nrow(gaze_shape_cmp) == 0) {
+  tibble()
+} else {
+  gaze_shape_cmp %>%
+    select(session_id, participant_id, round, spinner_type, spin_index,
+           visible, mean_dist_shape, prop_on_shape) %>%
+    pivot_wider(
+      names_from = visible,
+      values_from = c(mean_dist_shape, prop_on_shape),
+      names_expand = TRUE
+    )
+}
+
+missing_pair <- setdiff(pair_cols, names(capture_wide))
+if (length(missing_pair) > 0) {
+  capture_wide[missing_pair] <- NA_real_
+}
+
+capture_wide <- capture_wide %>%
+  filter(!is.na(mean_dist_shape_visible), !is.na(mean_dist_shape_off)) %>%
+  mutate(
+    dist_capture = mean_dist_shape_off - mean_dist_shape_visible,
+    prop_capture = prop_on_shape_visible - prop_on_shape_off
+  )
+
+if (nrow(capture_wide) > 0) {
+  capture_round <- capture_wide %>%
+    group_by(session_id, participant_id, round, spinner_type) %>%
+    summarise(
+      dist_capture = mean(dist_capture, na.rm = TRUE),
+      prop_capture = mean(prop_capture, na.rm = TRUE),
+      mean_dist_visible = mean(mean_dist_shape_visible, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    left_join(rounds_c %>% select(session_id, round, flow), by = c("session_id", "round"))
+
+  print(capture_round %>%
+          group_by(spinner_type) %>%
+          summarise(across(c(dist_capture, prop_capture, mean_dist_visible),
+                           ~ mean(.x, na.rm = TRUE)), .groups = "drop"))
+
+  cap_m <- fit_gaussian(
+    dist_capture ~ spinner_type + (1 | participant_id),
+    capture_round
+  )
+  summarize_fit(cap_m)
+} else {
+  cat("No paired visible/off shape-gaze samples.\n")
+}
+```
+
+# 11. Gaze measures with flow, liking, and happiness
+
+One row per confirmatory wheel. Gaze is summarized first, then joined to that wheel’s ratings. Webcam error is often 100–200 px, so these are toward vs. away, not fixations.
+
+**Measures**
+
+- Needle and wheel AOI, and mean needle distance, while the wheel is spinning
+- Mean eccentricity (distance from wheel center, in wheel radii)
+- Sample-to-sample jump while spinning (stability, and also tracker noise)
+- Needle approach: mean distance early in the coast (`ms_to_land` ≥ 2 s) minus late (`≤ 500` ms). Positive = closer to the needle as the wheel slows
+- Mean distance to a visible distractor
+- Needle AOI while spinning minus while idle
+
+**Models.** Each gaze measure is the DV. Predictors are within-person centered flow, liking, and happiness (that wheel minus the child’s own mean), plus `spinner_type` and `round`, and a participant intercept. That asks whether a child who reports more flow or liking *than they usually do* looks differently on that wheel, holding wheel type fixed. With only one participant the between-person terms are dropped and the random intercept is omitted (`lm`). These associations are secondary; they do not license “flow causes focused attention.”
+
+```{r gaze-rating-features}
+if (!"on_wheel" %in% names(gaze_ok)) gaze_ok$on_wheel <- NA_real_
+if (!"dist_shape" %in% names(gaze_ok)) gaze_ok$dist_shape <- NA_real_
+if (!"shape_visible" %in% names(gaze_ok)) gaze_ok$shape_visible <- NA_real_
+if (!"shape_size" %in% names(gaze_ok)) gaze_ok$shape_size <- NA_real_
+
+finite_mean <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) NA_real_ else mean(x)
+}
+
+gaze_aoi <- gaze_ok %>%
+  filter(!is_test) %>%
+  group_by(session_id, participant_id, round, spinner_type) %>%
+  summarise(
+    n_gaze = n(),
+    n_spin_gaze = sum(spinning == 1, na.rm = TRUE),
+    prop_needle_spin = finite_mean(on_needle[spinning == 1] == 1),
+    prop_wheel_spin = finite_mean(on_wheel[spinning == 1] == 1),
+    mean_dist_needle_spin = finite_mean(dist_needle[spinning == 1]),
+    mean_ecc_spin = finite_mean(ecc[spinning == 1]),
+    prop_needle_idle = finite_mean(on_needle[is.na(spinning) | spinning != 1] == 1),
+    mean_dist_shape_vis = finite_mean(dist_shape[shape_visible == 1]),
+    prop_near_shape = finite_mean(
+      dist_shape[shape_visible == 1] <= (coalesce(shape_size[shape_visible == 1], 30) / 2)
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(prop_needle_spin_minus_idle = prop_needle_spin - prop_needle_idle)
+
+gaze_jump <- gaze_ok %>%
+  filter(!is_test, spinning == 1) %>%
+  arrange(session_id, round, t) %>%
+  group_by(session_id, participant_id, round, spinner_type) %>%
+  mutate(
+    dt = t - lag(t),
+    jump = sqrt((gaze_x - lag(gaze_x))^2 + (gaze_y - lag(gaze_y))^2)
+  ) %>%
+  filter(is.finite(jump), is.finite(dt), dt > 0, dt < 200) %>%
+  summarise(mean_jump_px = finite_mean(jump), .groups = "drop")
+
+gaze_coast_sum <- tibble(
+  session_id = character(),
+  participant_id = character(),
+  round = numeric(),
+  spinner_type = factor(levels = WHEEL_LEVELS),
+  dist_needle_late = numeric(),
+  dist_needle_early = numeric(),
+  needle_approach = numeric()
+)
+if (nrow(gaze_ok) > 0 &&
+    all(c("t_land", "spin_index") %in% names(spins_c)) &&
+    all(c("spin_index", "t") %in% names(gaze_ok))) {
+  gaze_coast_sum <- gaze_ok %>%
+    filter(is.na(is_test) | !is_test, spinning == 1) %>%
+    left_join(
+      spins_c %>% select(session_id, round, spin_index, spin_t_land = t_land),
+      by = c("session_id", "round", "spin_index")
+    ) %>%
+    filter(!is.na(spin_t_land), !is.na(t), t <= spin_t_land) %>%
+    mutate(ms_to_land = spin_t_land - t) %>%
+    group_by(session_id, participant_id, round, spinner_type) %>%
+    summarise(
+      dist_needle_late = finite_mean(dist_needle[ms_to_land <= 500]),
+      dist_needle_early = finite_mean(dist_needle[ms_to_land >= 2000]),
+      .groups = "drop"
+    ) %>%
+    mutate(needle_approach = dist_needle_early - dist_needle_late)
+}
+
+gaze_features <- gaze_aoi %>%
+  left_join(gaze_jump, by = c("session_id", "participant_id", "round", "spinner_type")) %>%
+  left_join(gaze_coast_sum, by = c("session_id", "participant_id", "round", "spinner_type"))
+
+gaze_rating <- gaze_features %>%
+  left_join(
+    rounds_c %>% select(session_id, round, flow, liking, happiness, n_spins),
+    by = c("session_id", "round")
+  ) %>%
+  group_by(participant_id) %>%
+  mutate(
+    flow_w = flow - mean(flow, na.rm = TRUE),
+    liking_w = liking - mean(liking, na.rm = TRUE),
+    happiness_w = happiness - mean(happiness, na.rm = TRUE),
+    flow_b = mean(flow, na.rm = TRUE),
+    liking_b = mean(liking, na.rm = TRUE),
+    happiness_b = mean(happiness, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+gaze_dvs <- c(
+  "prop_needle_spin",
+  "prop_wheel_spin",
+  "mean_dist_needle_spin",
+  "mean_ecc_spin",
+  "mean_jump_px",
+  "needle_approach",
+  "mean_dist_shape_vis",
+  "prop_near_shape",
+  "prop_needle_spin_minus_idle"
+)
+
+gaze_dv_labels <- c(
+  prop_needle_spin = "Prop. on needle (spinning)",
+  prop_wheel_spin = "Prop. on wheel (spinning)",
+  mean_dist_needle_spin = "Mean dist. to needle, px (spinning)",
+  mean_ecc_spin = "Mean eccentricity (wheel radii)",
+  mean_jump_px = "Sample-to-sample jump, px",
+  needle_approach = "Needle approach (early − late dist.)",
+  mean_dist_shape_vis = "Mean dist. to visible shape, px",
+  prop_near_shape = "Prop. on visible shape",
+  prop_needle_spin_minus_idle = "Needle AOI: spinning − idle"
+)
+
+cat("Wheels with gaze summaries:", nrow(gaze_rating), "\n")
+gaze_rating %>%
+  group_by(spinner_type) %>%
+  summarise(
+    n = n(),
+    across(any_of(gaze_dvs), ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+```
+
+## Correlations
+
+Pairwise, nested in people (untested). Gaze columns that are all missing are dropped.
+
+```{r gaze-rating-cor, fig.width=9, fig.height=7}
+cor_vars <- c("flow", "liking", "happiness", "n_spins", gaze_dvs)
+cor_data <- gaze_rating %>%
+  select(any_of(cor_vars)) %>%
+  select(where(~ sum(!is.na(.x)) >= 3))
+
+if (ncol(cor_data) >= 2 && nrow(na.omit(cor_data)) >= 3) {
+  cm <- cor(cor_data, use = "pairwise.complete.obs")
+  print(round(cm, 2))
+  as_tibble(cm, rownames = "var1") %>%
+    pivot_longer(-var1, names_to = "var2", values_to = "r") %>%
+    mutate(
+      var1 = recode(var1, !!!gaze_dv_labels, .default = var1),
+      var2 = recode(var2, !!!gaze_dv_labels, .default = var2)
+    ) %>%
+    ggplot(aes(var1, var2, fill = r)) +
+    geom_tile() +
+    geom_text(aes(label = sprintf("%.2f", r)), size = 2.6) +
+    scale_fill_gradient2(limits = c(-1, 1), name = "r") +
+    labs(
+      x = NULL, y = NULL,
+      title = "Round-level correlations: ratings and gaze"
+    ) +
+    theme(axis.text.x = element_text(angle = 40, hjust = 1))
+} else {
+  cat("Not enough complete rows for a correlation matrix.\n")
+}
+```
+
+```{r gaze-rating-scatter, fig.width=9, fig.height=8}
+rating_long <- gaze_rating %>%
+  select(participant_id, spinner_type, flow, liking, happiness, any_of(gaze_dvs)) %>%
+  pivot_longer(any_of(gaze_dvs), names_to = "measure", values_to = "gaze") %>%
+  mutate(measure = recode(measure, !!!gaze_dv_labels)) %>%
+  pivot_longer(c(flow, liking, happiness), names_to = "rating", values_to = "score") %>%
+  filter(is.finite(gaze), is.finite(score))
+
+if (nrow(rating_long) > 0) {
+  ggplot(rating_long, aes(score, gaze, color = spinner_type)) +
+    geom_point(alpha = 0.7) +
+    geom_smooth(aes(group = 1), method = "lm", se = FALSE, linewidth = 0.6, colour = "black") +
+    facet_grid(measure ~ rating, scales = "free_y") +
+    labs(
+      x = "Rating",
+      y = "Gaze measure",
+      color = "Spinner",
+      title = "Each gaze measure against flow, liking, and happiness"
+    ) +
+    theme(strip.text.y = element_text(angle = 0))
+} else {
+  cat("No paired rating–gaze rows to plot.\n")
+}
+```
+
+## Hierarchical models
+
+`gaze ~ flow_w + liking_w + happiness_w + spinner_type + round + (1 | participant)`. With two or more people, person means (`flow_b`, …) are also entered so the within-person slopes are not mixed with stable individual differences. The table keeps the rating coefficients; full `summary()` for each DV is printed underneath.
+
+```{r gaze-rating-hlm}
+tidy_fixed <- function(model) {
+  if (is.null(model)) return(tibble())
+  out <- try(broom.mixed::tidy(model, effects = "fixed"), silent = TRUE)
+  if (inherits(out, "try-error") || !is.data.frame(out)) {
+    out <- try(broom::tidy(model), silent = TRUE)
+  }
+  if (inherits(out, "try-error") || !is.data.frame(out)) return(tibble())
+  out
+}
+
+n_id <- n_distinct(gaze_rating$participant_id)
+use_between <- n_id >= 2
+
+hlm_rhs <- if (use_between) {
+  "flow_w + liking_w + happiness_w + flow_b + liking_b + happiness_b + spinner_type + round + (1 | participant_id)"
+} else {
+  "flow_w + liking_w + happiness_w + spinner_type + round + (1 | participant_id)"
+}
+
+rating_terms <- c(
+  "flow_w", "liking_w", "happiness_w",
+  "flow_b", "liking_b", "happiness_b"
+)
+
+gaze_hlm_list <- list()
+gaze_hlm_coef <- purrr::map_dfr(gaze_dvs, function(dv) {
+  dat <- gaze_rating %>%
+    filter(
+      is.finite(.data[[dv]]),
+      is.finite(flow_w), is.finite(liking_w), is.finite(happiness_w)
+    )
+  if (nrow(dat) < 4 || n_distinct(dat$spinner_type) < 2) {
+    cat(dv, ": skipped (too few rows).\n")
+    return(tibble())
+  }
+  form <- stats::as.formula(paste(dv, "~", hlm_rhs))
+  model <- fit_gaussian(form, dat)
+  gaze_hlm_list[[dv]] <<- model
+  tidy_fixed(model) %>%
+    filter(term %in% rating_terms) %>%
+    mutate(dv = dv, .before = 1)
+})
+
+if (nrow(gaze_hlm_coef) > 0) {
+  gaze_hlm_coef <- gaze_hlm_coef %>%
+    mutate(dv_label = recode(dv, !!!gaze_dv_labels))
+  print(gaze_hlm_coef)
+
+  p_coef <- ggplot(gaze_hlm_coef, aes(x = estimate, y = term)) +
+    geom_vline(xintercept = 0, linewidth = 0.3) +
+    geom_point() +
+    facet_wrap(~ dv_label, scales = "free_x") +
+    labs(
+      x = "Fixed-effect estimate (approx. 95% CI)",
+      y = NULL,
+      title = "Rating slopes for each gaze DV"
+    )
+  if ("std.error" %in% names(gaze_hlm_coef)) {
+    p_coef <- p_coef +
+      geom_errorbar(
+        aes(
+          xmin = estimate - 1.96 * std.error,
+          xmax = estimate + 1.96 * std.error
+        ),
+        height = 0.2,
+        orientation = "y"
+      )
+  }
+  print(p_coef)
+}
+
+purrr::iwalk(gaze_hlm_list, function(model, dv) {
+  cat("\n===== ", dv, " =====\n", sep = "")
+  summarize_fit(model)
+})
+```
+
+Single-rating checks (same controls, one rating at a time) in case flow, liking, and happiness are too collinear to interpret jointly.
+
+```{r gaze-rating-hlm-separate}
+sep_rhs_w <- if (use_between) {
+  list(
+    flow = "flow_w + flow_b + spinner_type + round + (1 | participant_id)",
+    liking = "liking_w + liking_b + spinner_type + round + (1 | participant_id)",
+    happiness = "happiness_w + happiness_b + spinner_type + round + (1 | participant_id)"
+  )
+} else {
+  list(
+    flow = "flow_w + spinner_type + round + (1 | participant_id)",
+    liking = "liking_w + spinner_type + round + (1 | participant_id)",
+    happiness = "happiness_w + spinner_type + round + (1 | participant_id)"
+  )
+}
+
+sep_need <- list(
+  flow = "flow_w",
+  liking = "liking_w",
+  happiness = "happiness_w"
+)
+
+gaze_sep_coef <- purrr::map_dfr(names(sep_rhs_w), function(rating) {
+  purrr::map_dfr(gaze_dvs, function(dv) {
+    dat <- gaze_rating %>%
+      filter(is.finite(.data[[dv]]), is.finite(.data[[sep_need[[rating]]]]))
+    if (nrow(dat) < 4) return(tibble())
+    form <- stats::as.formula(paste(dv, "~", sep_rhs_w[[rating]]))
+    tidy_fixed(fit_gaussian(form, dat)) %>%
+      filter(term %in% c(paste0(rating, "_w"), paste0(rating, "_b"))) %>%
+      mutate(dv = dv, rating = rating, .before = 1)
+  })
+})
+
+if (nrow(gaze_sep_coef) > 0) {
+  print(gaze_sep_coef %>% select(dv, rating, term, estimate, std.error, statistic, p.value))
+} else {
+  cat("Separate rating models skipped.\n")
+}
+```
+
+# 12. Gazemaps
+
+Wheel-centered, radius-normalized coordinates (`wx`, `wy`). Screen y increases downward; plots use `-wy` so the top of the screen is up. Restricted to spinning samples with eccentricity < 3 wheel radii. Descriptive only.
+
+```{r gazemap-helpers}
+circle_df <- tibble(
+  angle = seq(0, 2 * pi, length.out = 200),
+  x = cos(angle),
+  y = sin(angle)
+)
+
+# Typical needle box in wheel units from the gaze table (session median).
+needle_schematic <- gaze_spin %>%
+  filter(!is_test) %>%
+  summarise(
+    nx = median(nx, na.rm = TRUE),
+    ny = median(ny, na.rm = TRUE),
+    nw = median(nw, na.rm = TRUE),
+    nh = median(nh, na.rm = TRUE)
+  )
+
+needle_layer <- if (nrow(needle_schematic) == 1 && is.finite(needle_schematic$nw[[1]])) {
+  geom_rect(
+    data = needle_schematic,
+    aes(
+      xmin = nx - nw / 2,
+      xmax = nx + nw / 2,
+      ymin = -(ny + nh / 2),
+      ymax = -(ny - nh / 2)
+    ),
+    inherit.aes = FALSE,
+    fill = NA,
+    colour = "white",
+    linewidth = 0.4
+  )
+} else {
+  geom_blank()
+}
+
+add_wheel_overlay <- function(p) {
+  p +
+    geom_path(
+      data = circle_df,
+      aes(x, y),
+      inherit.aes = FALSE,
+      linewidth = 0.4,
+      colour = "white",
+      alpha = 0.9
+    ) +
+    needle_layer +
+    coord_fixed(xlim = c(-2.5, 2.5), ylim = c(-2.5, 2.5), expand = FALSE) +
+    labs(x = "Horizontal (wheel radii)", y = "Vertical (wheel radii, up = top of screen)")
+}
+
+# Prefer spinning, non-test samples. If those filters empty the table, keep
+# whatever gaze_ok still has so the maps are not blank.
+gazemap_data <- gaze_spin %>% filter(is.na(is_test) | !is_test)
+if (nrow(gazemap_data) == 0) gazemap_data <- gaze_spin
+if (nrow(gazemap_data) == 0) {
+  gazemap_data <- gaze_ok %>% filter(is.na(is_test) | !is_test)
+}
+if (nrow(gazemap_data) == 0) gazemap_data <- gaze_ok
+gazemap_data <- gazemap_data %>% mutate(plot_y = -wy)
+if (nrow(gazemap_data) == 0) {
+  cat("No gazemap data: no gaze rows with x,y survived the inclusion steps above.\n")
+} else {
+  cat("Gazemap samples:", nrow(gazemap_data), "\n")
+}
+
+gazemap <- function(df, title) {
+  if (nrow(df) < 20) {
+    p <- ggplot(df, aes(wx, plot_y)) +
+      geom_point(alpha = 0.25, size = 0.4) +
+      labs(title = paste0(title, " (points; n = ", nrow(df), ")"))
+  } else {
+    p <- ggplot(df, aes(wx, plot_y)) +
+      stat_density_2d(
+        geom = "raster",
+        aes(fill = after_stat(density)),
+        contour = FALSE,
+        n = 80
+      ) +
+      scale_fill_viridis_c(option = "magma", name = "Density") +
+      labs(title = title)
+  }
+  add_wheel_overlay(p) +
+    theme(
+      legend.position = "right",
+      panel.background = element_rect(fill = "grey10", colour = NA),
+      plot.background = element_rect(fill = "white", colour = NA)
+    )
+}
+```
+
+## By spinner type
+
+```{r gazemap-condition, fig.width=9, fig.height=7}
+if (nrow(gazemap_data) > 0) {
+  gazemap(gazemap_data, "Gaze while spinning (all confirmatory wheels)") +
+    facet_wrap(~ spinner_type)
+} else {
+  cat("No gazemap data.\n")
+}
+```
+
+## Per participant
+
+```{r gazemap-participant, fig.width=9, fig.height=7}
+if (nrow(gazemap_data) > 0) {
+  ids <- unique(gazemap_data$participant_id)
+  # One page of facets; wrap if many people
+  gazemap(gazemap_data, "Gaze while spinning, by participant") +
+    facet_wrap(~ participant_id, ncol = min(4, length(ids)))
+}
+```
+
+## Spinning vs idle, and just after shape onset
+
+```{r gazemap-splits, fig.width=9, fig.height=5}
+if (nrow(gaze_ok) > 0) {
+  split_df <- gaze_ok %>%
+    filter(!is_test, ecc < 3) %>%
+    mutate(
+      plot_y = -wy,
+      epoch = case_when(
+        spinning == 1 ~ "spinning",
+        TRUE ~ "idle"
+      )
+    )
+  print(gazemap(split_df, "Spinning vs idle") + facet_wrap(~ epoch))
+
+  onset <- gaze_ok %>%
+    filter(!is_test, shape_visible == 1, !is.na(ms_from_onset),
+           ms_from_onset >= 0, ms_from_onset <= 400, ecc < 3) %>%
+    mutate(plot_y = -wy)
+  if (nrow(onset) > 0) {
+    print(gazemap(onset, "0–400 ms after shape onset"))
+  }
+}
+```
+
+# 13. What these models are (and are not)
+
+- Confirmatory inference is the **6-level spinner type** on flow, liking, and happiness, with presentation order and a participant intercept.
+- Contrasts separate **reward magnitude** (`all5` vs `all1`; E = 3 wheels vs the two extremes) from **uncertainty among the four E = 3 wheels**.
+- Gaze maps and needle/distractor summaries are secondary and descriptive or controlled associations. They do not license “flow causes focused attention.”
+- The gaze-as-DV models ask whether same-round ratings predict looking, after wheel type and (when possible) each child’s own rating mean. That is still an association.
+- Webcam tracking is approximate. Needle and shape measures are toward vs. away, not research-grade fixations.
+
+# Appendix (exploratory — not for inference)
+
+Do not use this section for claims in a paper.
+
+## A. Condition means in variance space (no quadratic test)
+
+`all1`, `low`, and `all5` share variance 0. A quadratic in variance is not identified.
+
+```{r appendix-variance-plot, fig.width=7, fig.height=5}
+cond_means <- rounds_c %>%
+  group_by(spinner_type) %>%
+  summarise(
+    reward_variance = mean(reward_variance, na.rm = TRUE),
+    mean_flow = mean(flow, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+p_var <- ggplot(cond_means, aes(x = reward_variance, y = mean_flow, label = spinner_type)) +
+  geom_point(size = 3) +
+  labs(
+    x = "Programmed reward variance",
+    y = "Mean flow",
+    title = "Six discrete wheels — not a variance continuum"
+  )
+if (requireNamespace("ggrepel", quietly = TRUE)) {
+  p_var <- p_var + ggrepel::geom_text_repel()
+} else {
+  p_var <- p_var + geom_text(vjust = -0.6, size = 3)
+}
+p_var
+```
+
+## B. Round-level RPE and surprise recode spinner type
+
+Forced sequences are shared across participants. Within a wheel, every outcome has the same programmed probability, so mean surprise and mean |RPE| at the round level are essentially properties of `spinner_type`.
+
+```{r appendix-rpe-table}
+spins_c %>%
+  group_by(spinner_type) %>%
+  summarise(
+    mean_rpe = mean(rpe_design, na.rm = TRUE),
+    mean_abs_rpe = mean(abs_rpe_design, na.rm = TRUE),
+    mean_surprise = mean(outcome_surprise, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+```
+
+Optional sketch: spin-level running RPE (experienced mean of *prior* outcomes on that wheel, not a result).
+
+```{r appendix-running-rpe}
+running <- spins_c %>%
+  arrange(session_id, round, spin_index) %>%
+  group_by(session_id, round) %>%
+  mutate(
+    prior_mean = lag(cummean(outcome)),
+    running_rpe = outcome - prior_mean
+  ) %>%
+  ungroup()
+
+running %>%
+  filter(!is.na(running_rpe)) %>%
+  group_by(spinner_type) %>%
+  summarise(mean_running_rpe = mean(running_rpe), n = n(), .groups = "drop")
+```
+
+## C. Median-split liking × flow cells
+
+Cutpoints are the sample medians and will move when people are added.
+
+```{r appendix-median-split}
+med_l <- median(rounds_c$liking, na.rm = TRUE)
+med_f <- median(rounds_c$flow, na.rm = TRUE)
+
+rounds_c %>%
+  filter(!is.na(liking), !is.na(flow)) %>%
+  mutate(
+    cell = case_when(
+      liking >= med_l & flow >= med_f ~ "high liking / high flow",
+      liking >= med_l & flow < med_f ~ "high liking / low flow",
+      liking < med_l & flow >= med_f ~ "low liking / high flow",
+      TRUE ~ "low liking / low flow"
+    )
+  ) %>%
+  count(cell)
+```
+
+## D. Lagged persistence (T = 6; Nickell bias)
+
+Not Poisson: spins are 4–12. A lagged Gaussian model is shown only as a sketch.
+
+```{r appendix-lag}
+lagged <- rounds_c %>%
+  group_by(participant_id, session_id) %>%
+  arrange(round, .by_group = TRUE) %>%
+  mutate(
+    prior_flow = lag(flow),
+    next_n_spins = lead(n_spins)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(prior_flow), !is.na(next_n_spins))
+
+if (nrow(lagged) > 0) {
+  lag_m <- fit_gaussian(
+    next_n_spins ~ prior_flow + spinner_type + (1 | participant_id),
+    lagged
+  )
+  summarize_fit(lag_m)
+  ggplot(lagged, aes(prior_flow, next_n_spins)) +
+    geom_jitter(width = 0.15, height = 0.15, alpha = 0.5) +
+    labs(
+      x = "Flow in round t",
+      y = "Spins in round t + 1",
+      title = "Lagged persistence (exploratory; T = 6)"
+    )
+}
+```
+
+## E. Concurrent flow and happiness
+
+Same-round ratings. Association, not `flow → happiness`.
+
+```{r appendix-happiness-assoc}
+ggplot(rounds_c, aes(flow, happiness)) +
+  geom_jitter(width = 0.15, height = 0.1, alpha = 0.5) +
+  labs(x = "Flow", y = "Happiness", title = "Concurrent ratings")
+```
+
+## F. Nested correlation heatmap
+
+The fuller rating × gaze matrix is in section 11. This cell is the smaller set that includes programmed reward properties.
+
+```{r appendix-cor}
+cor_data <- rounds_c %>%
+  left_join(
+    gaze_rating %>% select(session_id, round, any_of(c("prop_needle_spin", "mean_dist_needle_spin"))),
+    by = c("session_id", "round")
+  ) %>%
+  select(flow, liking, happiness, n_spins, expected_reward, reward_variance,
+         any_of(c("prop_needle_spin", "mean_dist_needle_spin")))
+
+if (nrow(na.omit(cor_data)) > 2) {
+  cm <- cor(cor_data, use = "pairwise.complete.obs")
+  print(round(cm, 2))
+  as_tibble(cm, rownames = "var1") %>%
+    pivot_longer(-var1, names_to = "var2", values_to = "r") %>%
+    ggplot(aes(var1, var2, fill = r)) +
+    geom_tile() +
+    scale_fill_gradient2(limits = c(-1, 1)) +
+    labs(x = NULL, y = NULL, title = "Round-level correlations (nested, untested)") +
+    theme(axis.text.x = element_text(angle = 40, hjust = 1))
+}
+```
+
+## G. Sample-to-sample AOI changes (not attention switching)
+
+WebGazer error is often 100–200 px, so region chatter at 34 ms is tracker noise.
+
+```{r appendix-switch}
+if (nrow(gaze_spin) > 0) {
+  sw <- gaze_spin %>%
+    filter(!is_test) %>%
+    arrange(session_id, round, t) %>%
+    group_by(session_id, round) %>%
+    mutate(switch = on_needle != lag(on_needle)) %>%
+    summarise(switch_rate = mean(switch, na.rm = TRUE), .groups = "drop")
+  summary(sw$switch_rate)
+}
+```
+
+## H. Which gaze measure tracks flow? (exploratory)
+
+New wheel-level summaries ranked by correlation with same-round flow, plus Wu et al. (IEEE VRW 2025) constructs: I-DT fixations and saccade velocity from WebGazer, blink rate from Face Landmarker blendshapes (EAR backup), and a webcam pupil/iris proxy (iris pixel size is a head-distance confound, not Tobii pupil diameter). Sessions without `iris` rows skip blink/pupil. Uncorrected. Script: `flow_gaze_eda.R`.
+
+Blink rules: a blink is a closure lasting 50–500 ms, detected with hysteresis (blendshape closes at ≥ 0.5 and reopens at ≤ 0.3; EAR uses a per-session cutoff of 0.75 × the open-eye median to close and 0.85 × to reopen). Face loss or a sample gap over 200 ms ends an episode without counting it. Rates are per second of valid tracking, not per second of trial. The two methods' per-sample agreement (percent and Cohen's kappa) is printed as QC; blink rate is only interpretable where they agree. `head_dist_rel` is a relative head-distance covariate, not millimetres.
+
+```{r appendix-flow-gaze-eda}
+eda_script <- "flow_gaze_eda.R"
+if (file.exists(eda_script)) {
+  source(eda_script, local = TRUE)
+} else {
+  cat("flow_gaze_eda.R not found next to this Rmd.\n")
+}
+```
+
+# Session check
+
+```{r final-check}
+cat("MASTER data rows:", nrow(data), "\n")
+count(data, row_type)
+print(session_quality)
+cat("Confirmatory participants:", n_participants, " rounds:", n_rounds, "\n")
+```

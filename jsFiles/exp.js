@@ -195,6 +195,9 @@ const exp = (function() {
             <p>When your face is centered in the box and the box is green, you can click to continue.</p>
         `,
         data: { phase: "eyetracking_init_camera" },
+        on_finish: function() {
+            if (window.SpinnerIris) window.SpinnerIris.init();
+        },
     };
 
     p.calibrationInstructions = {
@@ -230,6 +233,41 @@ const exp = (function() {
         },
     };
 
+    // Accuracy check on the frozen gaze model: run once after calibration and
+    // once after the bonus spin, so offsets can be compared for drift.
+    const makeValidationInstructions = (phase) => ({
+        type: jsPsychHtmlButtonResponse,
+        stimulus: `
+          <div class='parent'>
+            <p>Now some dots will appear on the screen, one at a time.</p>
+            <p>Look right at each dot until it goes away. You don't need to click!</p>
+          </div>
+        `,
+        choices: ["Ready"],
+        data: { phase },
+    });
+
+    const makeValidation = (phase) => ({
+        type: jsPsychWebgazerValidate,
+        validation_points: [[25, 25], [75, 25], [50, 50], [25, 75], [75, 75]],
+        roi_radius: 150,
+        point_size: 30,
+        time_to_saccade: 1000,
+        validation_duration: 2000,
+        show_validation_data: false,
+        data: { phase },
+        on_finish: function(data) {
+            if (jsPsych.extensions.webgazer) jsPsych.extensions.webgazer.stopMouseCalibration();
+            Object.assign(data, summarizeValidation(data.raw_gaze, 150));
+            data.raw_gaze = null;
+        },
+    });
+
+    p.validationPreInstructions = makeValidationInstructions("eyetracking_validation_pre_instructions");
+    p.validationPre = makeValidation("eyetracking_validation_pre");
+    p.validationPostInstructions = makeValidationInstructions("eyetracking_validation_post_instructions");
+    p.validationPost = makeValidation("eyetracking_validation_post");
+
     p.calibrationDone = {
         type: jsPsychHtmlButtonResponse,
         stimulus: `
@@ -245,7 +283,8 @@ const exp = (function() {
             if (jsPsych.extensions.webgazer) {
                 jsPsych.extensions.webgazer.hideVideo();
                 jsPsych.extensions.webgazer.hidePredictions();
-                jsPsych.extensions.webgazer.startMouseCalibration();
+                // freeze the model: clicks and mouse moves would otherwise keep retraining it
+                jsPsych.extensions.webgazer.stopMouseCalibration();
             }
         },
     };
@@ -1175,7 +1214,7 @@ const exp = (function() {
     *
     */
 
-    // CSV is uploaded once in jsPsych on_finish (see utils.js) to OSF via DataPipe;
+    // CSV is uploaded once in jsPsych on_finish (see utils.js) to Zenodo via DataPipe;
     // nothing is saved on the participant's computer
 
     return p;
@@ -1207,6 +1246,8 @@ const attachGaze = (node) => {
     if (next.type) {
         const targets = gazeTargetsFor(next);
         const userOnStart = next.on_start;
+        const userOnLoad = next.on_load;
+        const userOnFinish = next.on_finish;
         next.on_start = function(trial) {
             if (!skipEyeTracking) {
                 const existing = trial.extensions || [];
@@ -1216,6 +1257,20 @@ const attachGaze = (node) => {
                 }]);
             }
             if (typeof userOnStart === "function") userOnStart(trial);
+        };
+        next.on_load = function() {
+            if (!skipEyeTracking) {
+                TrialTiming.begin();
+                if (window.SpinnerIris) window.SpinnerIris.beginTrial();
+            }
+            if (typeof userOnLoad === "function") userOnLoad.apply(this, arguments);
+        };
+        next.on_finish = function(data) {
+            if (!skipEyeTracking) {
+                if (window.SpinnerIris) data.iris_data = window.SpinnerIris.endTrial();
+                Object.assign(data, TrialTiming.end(data));
+            }
+            if (typeof userOnFinish === "function") return userOnFinish.apply(this, arguments);
         };
     }
     return next;
@@ -1230,6 +1285,8 @@ fullPath.push(
             exp.initCamera,
             exp.calibrationInstructions,
             exp.calibration,
+            exp.validationPreInstructions,
+            exp.validationPre,
             exp.calibrationDone,
         ],
         conditional_function: () => !skipEyeTracking,
@@ -1251,8 +1308,12 @@ fullPath.push(
         exp.chooseTransition,
         exp.bonusChoice,
         exp.bonusSpin,
-        exp.outroVideo,
-    ])
+    ]),
+    {
+        timeline: [exp.validationPostInstructions, exp.validationPost],
+        conditional_function: () => !skipEyeTracking,
+    },
+    ...attachGaze([exp.outroVideo])
 );
 
 const timeline = [

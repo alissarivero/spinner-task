@@ -6,6 +6,7 @@
   <script src="./jsFiles/extension-webgazer.js"></script>
   <script src="./jsFiles/plugin-webgazer-init-camera.js"></script>
   <script src="./jsFiles/plugin-webgazer-calibrate.js"></script>
+  <script src="./jsFiles/plugin-webgazer-validate.js"></script>
   <script src="./jsFiles/utils.js"></script>
   <script src="./jsFiles/plugin-canvas-button-response.js"></script>
   <script src="./jsFiles/plugin-html-keyboard-response.js"></script>
@@ -14,6 +15,11 @@
   <script src="./jsFiles/plugin-instructions.js"></script>
   <script src="./jsFiles/plugin-external-html.js"></script>
   <script src="./jsFiles/plugin-html-button-response.js"></script>
+  <script type="module">
+    import { FaceLandmarker, FilesetResolver } from "./jsFiles/mediapipe/vision_bundle.mjs";
+    window.mpFaceLandmarker = { FaceLandmarker, FilesetResolver };
+  </script>
+  <script src="./jsFiles/iris-tracker.js"></script>
   <link href="./css/jspsych.css" rel="stylesheet" type="text/css"></link>
   <title>Spinner</title>
 </head>
